@@ -1,0 +1,22 @@
+[package]
+name = "texture-compressor"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Encode pixels into GPU block-compressed textures"
+repository = "https://github.com/Tavrin/texture-compressor"
+readme = "README.md"
+keywords = ["texture", "compression", "bc7"]
+categories = ["encoding", "graphics"]
+rust-version = "1.98"
+include = ["src/**", "tests/**", "examples/**", "build.rs", "README.md", "CHANGELOG.md", "LICENSE-MIT", "LICENSE-APACHE"]
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+parallel = ["dep:rayon"]
+
+[dependencies]
+rayon = { version = "1.11", optional = true }

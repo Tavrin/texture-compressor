@@ -1,0 +1,17 @@
+name: CI
+# Enable push and pull request triggers when the repository goes public.
+on: workflow_dispatch
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - run: tools/check_public_text.sh
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --target wasm32-unknown-unknown
