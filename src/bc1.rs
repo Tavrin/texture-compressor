@@ -392,7 +392,7 @@ pub fn encode(px: &[[u8; 4]; 16], effort: Effort, policy: AlphaPolicy) -> [u8; 8
                 }
             }
         }
-        // P7 corpus sweep: the largest positive error bins have residual
+        // Corpus sweep: the largest positive error bins have residual
         // above 1024 and a maximum channel span of 64..159.
         let span = (0..3).map(|c| hi[c] - lo[c]).max().unwrap();
         if best.0 > 1024 && (64..160).contains(&span) {

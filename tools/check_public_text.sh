@@ -4,7 +4,7 @@ cd "$(git rev-parse --show-toplevel)"
 private='mo''ss'
 user='et''ienne'
 planning='rf''c'
-pattern="/home/[^/[:space:]]+/|/mnt/|${user}|\\b${private}\\b|\\blane\\b|\\bapollo\\b|\\b[[:alnum:]_]+-([a-z0-9]{4}[0-9]|[a-z0-9]{3}[0-9][a-z0-9]|[a-z0-9]{2}[0-9][a-z0-9]{2}|[a-z0-9][0-9][a-z0-9]{3}|[0-9][a-z0-9]{4})\\b|${planning}[[:space:]]*[0-9]+|S1[[:space:]]+oracle|phase[[:space:]]+0\\.[0-9]+"
+pattern="/home/[^/[:space:]]+/|/mnt/|${user}|\\b${private}\\b|\\blane\\b|\\bapollo\\b|\\b[[:alnum:]_]+-([a-z0-9]{4}[0-9]|[a-z0-9]{3}[0-9][a-z0-9]|[a-z0-9]{2}[0-9][a-z0-9]{2}|[a-z0-9][0-9][a-z0-9]{3}|[0-9][a-z0-9]{4})\\b|${planning}[[:space:]]*[0-9]+|S1[[:space:]]+oracle|phase[[:space:]]+0\\.[0-9]+|\\bP[0-9]+[[:space:]]+(v[0-9]+|bars?|sweep|diagnostic|corpus|measurements|results)\\b|\\bthe[[:space:]]+P[0-9]+\\b"
 set +e
 git grep --untracked -niIE "$pattern" -- . ':!tools/check_public_text.sh'
 status=$?

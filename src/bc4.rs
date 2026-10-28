@@ -211,7 +211,7 @@ pub fn encode(pixels: &[[u8; 4]; 16], effort: Effort, channel: usize) -> [u8; 8]
                 evaluate(&v, a, b, &mut best);
             }
         }
-        // P7 corpus diagnostic: low-span distributed roughness blocks can
+        // Corpus diagnostic: low-span distributed roughness blocks can
         // retain residual error below the ordinary neighborhood gate.
         if effort == Effort::Balanced && (8..=15).contains(&(max - min)) && best.0 > 0 {
             evaluate_balanced(&v, max - 1, min + 1, &mut best);

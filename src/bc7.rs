@@ -1,6 +1,8 @@
 //! Experimental scalar BC7 encoding. Format: Microsoft BC7 mode reference.
 use crate::Effort;
 
+#[path = "bc7_fast.rs"]
+mod fast;
 #[path = "bc7_tables.rs"]
 mod tables;
 use tables::{ANCHOR2, ANCHOR3A, ANCHOR3B, PART2, PART3};
@@ -979,7 +981,7 @@ fn rank_moments(
     score as u64
 }
 
-// Bounded search selected from the P8 instruction/quality measurements.
+// Bounded search chosen from corpus instruction and quality measurements.
 fn quality_capped(pixels: &[[u8; 4]; 16]) -> [u8; 16] {
     if let Some(block) = solid_rgba(pixels) {
         return block;
@@ -1035,9 +1037,15 @@ fn quality_capped(pixels: &[[u8; 4]; 16]) -> [u8; 16] {
 }
 
 pub(crate) fn encode(pixels: &[[u8; 4]; 16], effort: Effort) -> [u8; 16] {
-    if effort == Effort::Quality {
-        return quality_capped(pixels);
+    match effort {
+        Effort::Fast => fast::encode(pixels),
+        Effort::Balanced => balanced(pixels),
+        Effort::Quality => quality_capped(pixels),
     }
+}
+
+fn balanced(pixels: &[[u8; 4]; 16]) -> [u8; 16] {
+    let effort = Effort::Balanced;
     if let Some(block) = solid_rgba(pixels) {
         return block;
     }
@@ -1049,16 +1057,15 @@ pub(crate) fn encode(pixels: &[[u8; 4]; 16], effort: Effort) -> [u8; 16] {
     } else {
         mode6(pixels, effort)
     };
-    let rotations = if effort == Effort::Fast { 1 } else { 4 };
-    for rotation in 0..rotations {
+    for rotation in 0..4 {
         let candidate = mode5(pixels, rotation);
         if candidate.1 < best.1 {
             best = candidate;
         }
     }
     if best.1 != 0 {
-        for rotation in 0..rotations {
-            for selection in 0..if effort == Effort::Fast { 1 } else { 2 } {
+        for rotation in 0..4 {
+            for selection in 0..2 {
                 let candidate = mode4(pixels, rotation, selection);
                 if candidate.1 < best.1 {
                     best = candidate;
@@ -1077,45 +1084,26 @@ pub(crate) fn encode(pixels: &[[u8; 4]; 16], effort: Effort) -> [u8; 16] {
             }
             r2.sort_unstable();
             if opaque {
-                if effort == Effort::Balanced {
-                    let candidate = partition_mode_ranked(pixels, 1, effort, &r2);
-                    if candidate.1 < best.1 {
-                        best = candidate;
-                    }
-                    if pixels.iter().all(|p| p[0] == p[1] && p[1] == p[2]) {
-                        let mut r3_16 = [(u64::MAX, 0usize); 64];
-                        for (p, rank) in r3_16.iter_mut().enumerate().take(16) {
-                            *rank = (rank_moments(&lut, total, MASKS3[p], 3, 3), p);
-                        }
-                        r3_16.sort_unstable();
-                        let candidate = partition_mode_ranked(pixels, 0, effort, &r3_16);
-                        if candidate.1 < best.1 {
-                            best = candidate;
-                        }
-                    }
-                    let candidate = partition_mode_ranked(pixels, 3, effort, &r2);
-                    if candidate.1 < best.1 {
-                        best = candidate;
-                    }
-                } else {
-                    let mut r3 = [(0u64, 0usize); 64];
-                    for (p, r) in r3.iter_mut().enumerate() {
-                        *r = (rank_moments(&lut, total, MASKS3[p], 3, 3), p);
-                    }
-                    r3.sort_unstable();
+                let candidate = partition_mode_ranked(pixels, 1, effort, &r2);
+                if candidate.1 < best.1 {
+                    best = candidate;
+                }
+                if pixels.iter().all(|p| p[0] == p[1] && p[1] == p[2]) {
                     let mut r3_16 = [(u64::MAX, 0usize); 64];
-                    for (dst, src) in r3_16.iter_mut().zip(r3.iter().filter(|r| r.1 < 16)) {
-                        *dst = *src;
+                    for (p, rank) in r3_16.iter_mut().enumerate().take(16) {
+                        *rank = (rank_moments(&lut, total, MASKS3[p], 3, 3), p);
                     }
-                    for (mode, ranks) in [(1, &r2), (0, &r3_16), (2, &r3), (3, &r2)] {
-                        let candidate = partition_mode_ranked(pixels, mode, effort, ranks);
-                        if candidate.1 < best.1 {
-                            best = candidate;
-                        }
+                    r3_16.sort_unstable();
+                    let candidate = partition_mode_ranked(pixels, 0, effort, &r3_16);
+                    if candidate.1 < best.1 {
+                        best = candidate;
                     }
                 }
-            }
-            if !opaque || effort != Effort::Balanced {
+                let candidate = partition_mode_ranked(pixels, 3, effort, &r2);
+                if candidate.1 < best.1 {
+                    best = candidate;
+                }
+            } else {
                 let candidate = partition_mode_ranked(pixels, 7, effort, &r2);
                 if candidate.1 < best.1 {
                     best = candidate;

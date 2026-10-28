@@ -13,13 +13,17 @@ pub enum Format {
     Bc3,
     Bc4,
     Bc5,
-    /// Experimental BC7 encoder; not yet qualified against the P8 bars.
+    /// BC7. The Fast preset is qualified; Balanced and Quality are still experimental.
     Bc7,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Effort {
+    /// Fastest search. BC7 fits each subset along its principal axis, refines
+    /// endpoints by least squares, and searches further only where a block's
+    /// error stays high or its colours are few.
     Fast,
-    /// Balanced search; BC1, BC3, BC4 and BC5 use the experimental P7 v3 search.
+    /// Balanced search. For BC1, BC3, BC4 and BC5 it costs fewer instructions than
+    /// common reference encoders at higher quality; for BC7 it is still experimental.
     Balanced,
     Quality,
 }
