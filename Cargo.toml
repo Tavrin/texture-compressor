@@ -1,6 +1,6 @@
 [package]
 name = "texture-compressor"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Deterministic BC1, BC3, BC4, BC5 and BC7 texture encoding for native and WebAssembly"

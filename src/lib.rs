@@ -86,6 +86,23 @@ pub enum Error {
     /// Input channels or alpha policy are incompatible with the output format.
     UnsupportedPolicy,
 }
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Error::EmptyImage => "image width or height is zero",
+            Error::InvalidStride => "row stride is smaller than a complete input row",
+            Error::ShortInput => "input does not contain every visible texel",
+            Error::ShortOutput => "output buffer is smaller than the encoded length",
+            Error::Overflow => "image or output size cannot be represented",
+            Error::AllocationFailed => "reserving the output buffer failed",
+            Error::UnsupportedPolicy => {
+                "input channels or alpha policy are incompatible with the output format"
+            }
+        })
+    }
+}
+#[cfg(feature = "std")]
+impl std::error::Error for Error {}
 /// Borrowed strided R8, RG8 or RGBA8 image with validated dimensions and storage.
 #[derive(Clone, Copy, Debug)]
 pub struct ImageView<'a> {

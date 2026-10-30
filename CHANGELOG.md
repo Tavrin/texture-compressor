@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.1.1] - 2026-10-30
+
+- `Error` implements `Display`, and `std::error::Error` with the `std`
+  feature, so `?` converts it into `Box<dyn std::error::Error>`.
+
 ## [0.1.0] - 2026-10-30
 
 - Initial release with BC1, BC3, BC4, BC5 and BC7 encoding and Fast,
