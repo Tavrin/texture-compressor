@@ -5,10 +5,14 @@ use crate::Effort;
 mod fast;
 #[path = "bc7_tables.rs"]
 mod tables;
-use tables::{ANCHOR2, ANCHOR3A, ANCHOR3B, PART2, PART3};
+#[cfg(test)]
+use tables::{ANCHOR2, ANCHOR3A, ANCHOR3B};
+use tables::{PART2, PART3};
 
+#[cfg(test)]
 const W: [i32; 16] = [0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64];
 
+#[cfg(test)]
 fn quantize(e: [[i32; 4]; 2], p: [i32; 2]) -> [[i32; 4]; 2] {
     let mut q = [[0; 4]; 2];
     for k in 0..2 {
@@ -18,6 +22,7 @@ fn quantize(e: [[i32; 4]; 2], p: [i32; 2]) -> [[i32; 4]; 2] {
     }
     q
 }
+#[cfg(test)]
 fn score(pixels: &[[u8; 4]; 16], e: [[i32; 4]; 2]) -> (u64, [usize; 16]) {
     let mut indices = [0; 16];
     let mut total = 0;
@@ -37,6 +42,7 @@ fn score(pixels: &[[u8; 4]; 16], e: [[i32; 4]; 2]) -> (u64, [usize; 16]) {
     }
     (total, indices)
 }
+#[cfg(test)]
 fn fit(pixels: &[[u8; 4]; 16], indices: [usize; 16], old: [[i32; 4]; 2]) -> [[i32; 4]; 2] {
     let mut aa = 0i64;
     let mut ab = 0i64;
@@ -71,6 +77,7 @@ fn put(bits: &mut u128, offset: &mut u32, value: u32, width: u32) {
 }
 // Improve the decoded SSE with selectors fixed, preserving each endpoint's
 // shared p-bit. Re-selecting indices afterward cannot increase the error.
+#[cfg(test)]
 fn refine_mode6(
     pixels: &[[u8; 4]; 16],
     endpoints: [[i32; 4]; 2],
@@ -116,6 +123,7 @@ fn refine_mode6(
     }
 }
 
+#[cfg(test)]
 fn mode6(pixels: &[[u8; 4]; 16], effort: Effort) -> ([u8; 16], u64) {
     let mut lo = [255; 4];
     let mut hi = [0; 4];
@@ -193,6 +201,7 @@ fn mode6(pixels: &[[u8; 4]; 16], effort: Effort) -> ([u8; 16], u64) {
 
 // Mode 5 provides separate color and scalar selectors. Rotations select which
 // source channel is represented by the scalar stream.
+#[cfg(test)]
 fn mode5(pixels: &[[u8; 4]; 16], rotation: usize) -> ([u8; 16], u64) {
     let mut src = *pixels;
     if rotation != 0 {
@@ -309,6 +318,7 @@ fn partition_rank(pixels: &[[u8; 4]; 16], pattern: u32, channels: usize, subsets
     score as u64
 }
 
+#[cfg(test)]
 fn subset_fit(
     pixels: &[[u8; 4]; 16],
     pattern: u32,
@@ -445,6 +455,7 @@ fn subset_fit(
 // Conservative continuous-line SSE bound. Gershgorin bounds the largest
 // covariance eigenvalue from above; final per-channel interpolation rounding
 // can move an m-by-c vector by at most sqrt(m*c)/2 <= 4 in Euclidean norm.
+#[cfg(test)]
 fn partition_lower_bound(
     pixels: &[[u8; 4]; 16],
     pattern: u32,
@@ -487,6 +498,7 @@ fn partition_lower_bound(
     bound
 }
 
+#[cfg(test)]
 fn partition_mode_ranked(
     pixels: &[[u8; 4]; 16],
     mode: usize,
@@ -496,6 +508,7 @@ fn partition_mode_ranked(
     partition_mode_ranked_with_bound(pixels, mode, effort, ranks, true)
 }
 
+#[cfg(test)]
 fn partition_mode_ranked_with_bound(
     pixels: &[[u8; 4]; 16],
     mode: usize,
@@ -632,6 +645,7 @@ fn partition_mode(pixels: &[[u8; 4]; 16], mode: usize, effort: Effort) -> ([u8; 
     partition_mode_ranked(pixels, mode, effort, &ranks)
 }
 
+#[cfg(test)]
 fn mode4(pixels: &[[u8; 4]; 16], rotation: usize, selection: usize) -> ([u8; 16], u64) {
     let mut src = *pixels;
     if rotation != 0 {
@@ -789,6 +803,7 @@ fn solid_rgba(pixels: &[[u8; 4]; 16]) -> Option<[u8; 16]> {
 
 // A bounded endpoint-neighborhood search for opaque grayscale blocks. Scores
 // the actual 4-bit BC7 palette; no texture identity participates in decisions.
+#[cfg(test)]
 fn gray_mode6(pixels: &[[u8; 4]; 16], effort: Effort) -> ([u8; 16], u64) {
     debug_assert!(pixels
         .iter()
@@ -887,6 +902,7 @@ fn gray_mode6(pixels: &[[u8; 4]; 16], effort: Effort) -> ([u8; 16], u64) {
 // A 16-pixel subset has sum <= 4080 and square sum <= 1,040,400;
 // count * square and sum * sum are at most 16,646,400 per channel,
 // and their four-channel sum is at most 66,585,600.
+#[cfg(test)]
 #[derive(Clone, Copy, Default)]
 struct Moments {
     count: u32,
@@ -913,6 +929,7 @@ const fn partition_masks(patterns: [u32; 64]) -> [[u16; 2]; 64] {
 const MASKS2: [[u16; 2]; 64] = partition_masks(PART2);
 const MASKS3: [[u16; 2]; 64] = partition_masks(PART3);
 
+#[cfg(test)]
 fn moment_lut(pixels: &[[u8; 4]; 16]) -> ([[Moments; 16]; 4], Moments) {
     let mut lut = [[Moments::default(); 16]; 4];
     for row in 0..4 {
@@ -938,6 +955,7 @@ fn moment_lut(pixels: &[[u8; 4]; 16]) -> ([[Moments; 16]; 4], Moments) {
     }
     (lut, total)
 }
+#[cfg(test)]
 fn mask_moments(lut: &[[Moments; 16]; 4], mask: u16) -> Moments {
     let mut m = Moments::default();
     for (row, table) in lut.iter().enumerate() {
@@ -950,6 +968,7 @@ fn mask_moments(lut: &[[Moments; 16]; 4], mask: u16) -> Moments {
     }
     m
 }
+#[cfg(test)]
 fn rank_moments(
     lut: &[[Moments; 16]; 4],
     total: Moments,
@@ -981,137 +1000,21 @@ fn rank_moments(
     score as u64
 }
 
-// Bounded search chosen from corpus instruction and quality measurements.
-fn quality_capped(pixels: &[[u8; 4]; 16]) -> [u8; 16] {
-    if let Some(block) = solid_rgba(pixels) {
-        return block;
-    }
-    let opaque = pixels.iter().all(|p| p[3] == 255);
-    let gray = opaque && pixels.iter().all(|p| p[0] == p[1] && p[1] == p[2]);
-    let mut best = if gray {
-        gray_mode6(pixels, Effort::Balanced)
-    } else {
-        mode6(pixels, Effort::Fast)
-    };
-    for candidate in [mode5(pixels, 0), mode4(pixels, 0, 0)] {
-        if candidate.1 < best.1 {
-            best = candidate;
-        }
-    }
-    let low_span = opaque
-        && (0..3)
-            .map(|c| {
-                pixels.iter().map(|p| p[c]).max().unwrap()
-                    - pixels.iter().map(|p| p[c]).min().unwrap()
-            })
-            .max()
-            .unwrap()
-            <= 16;
-    if best.1 > 64 || low_span {
-        let (lut, total) = moment_lut(pixels);
-        let mut ranks = [(0u64, 0usize); 64];
-        for (p, rank) in ranks.iter_mut().enumerate() {
-            *rank = (
-                rank_moments(&lut, total, MASKS2[p], 2, if opaque { 3 } else { 4 }),
-                p,
-            );
-        }
-        ranks.sort_unstable();
-        for mode in if opaque { [1usize, 3] } else { [7usize, 7] } {
-            let effort = if low_span && mode == 3 {
-                Effort::Balanced
-            } else {
-                Effort::Fast
-            };
-            // This measured small search uses no covariance-bound setup.
-            let candidate = partition_mode_ranked_with_bound(pixels, mode, effort, &ranks, false);
-            if candidate.1 < best.1 {
-                best = candidate;
-            }
-            if !opaque {
-                break;
-            }
-        }
-    }
-    best.0
-}
-
 pub(crate) fn encode(pixels: &[[u8; 4]; 16], effort: Effort) -> [u8; 16] {
     match effort {
         Effort::Fast => fast::encode(pixels),
-        Effort::Balanced => balanced(pixels),
-        Effort::Quality => quality_capped(pixels),
+        Effort::Balanced => fast::encode_with(pixels, &fast::BALANCED),
+        Effort::Quality => fast::encode_with(pixels, &fast::QUALITY),
     }
 }
 
-fn balanced(pixels: &[[u8; 4]; 16]) -> [u8; 16] {
-    let effort = Effort::Balanced;
-    if let Some(block) = solid_rgba(pixels) {
-        return block;
-    }
-    let mut best = if pixels
-        .iter()
-        .all(|p| p[0] == p[1] && p[1] == p[2] && p[3] == 255)
-    {
-        gray_mode6(pixels, effort)
-    } else {
-        mode6(pixels, effort)
-    };
-    for rotation in 0..4 {
-        let candidate = mode5(pixels, rotation);
-        if candidate.1 < best.1 {
-            best = candidate;
-        }
-    }
-    if best.1 != 0 {
-        for rotation in 0..4 {
-            for selection in 0..2 {
-                let candidate = mode4(pixels, rotation, selection);
-                if candidate.1 < best.1 {
-                    best = candidate;
-                }
-            }
-        }
-        if best.1 != 0 {
-            let opaque = pixels.iter().all(|p| p[3] == 255);
-            let (lut, total) = moment_lut(pixels);
-            let mut r2 = [(0u64, 0usize); 64];
-            for (p, r) in r2.iter_mut().enumerate() {
-                *r = (
-                    rank_moments(&lut, total, MASKS2[p], 2, if opaque { 3 } else { 4 }),
-                    p,
-                );
-            }
-            r2.sort_unstable();
-            if opaque {
-                let candidate = partition_mode_ranked(pixels, 1, effort, &r2);
-                if candidate.1 < best.1 {
-                    best = candidate;
-                }
-                if pixels.iter().all(|p| p[0] == p[1] && p[1] == p[2]) {
-                    let mut r3_16 = [(u64::MAX, 0usize); 64];
-                    for (p, rank) in r3_16.iter_mut().enumerate().take(16) {
-                        *rank = (rank_moments(&lut, total, MASKS3[p], 3, 3), p);
-                    }
-                    r3_16.sort_unstable();
-                    let candidate = partition_mode_ranked(pixels, 0, effort, &r3_16);
-                    if candidate.1 < best.1 {
-                        best = candidate;
-                    }
-                }
-                let candidate = partition_mode_ranked(pixels, 3, effort, &r2);
-                if candidate.1 < best.1 {
-                    best = candidate;
-                }
-            } else {
-                let candidate = partition_mode_ranked(pixels, 7, effort, &r2);
-                if candidate.1 < best.1 {
-                    best = candidate;
-                }
-            }
-        }
-    }
-    best.0
+#[cfg(feature = "simd")]
+pub(crate) fn batch_width() -> usize {
+    fast::batch_width()
+}
+#[cfg(feature = "simd")]
+pub(crate) fn encode_batch(blocks: &[[[u8; 4]; 16]; 8], out: &mut [u8], effort: Effort) {
+    fast::encode_batch(blocks, out, effort);
 }
 
 #[cfg(test)]

@@ -162,6 +162,38 @@ pub fn encode_bc3_balanced(px: &[[u8; 4]; 16]) -> [u8; 8] {
     out[4..].copy_from_slice(&best.3.to_le_bytes());
     out
 }
+
+// At most twelve endpoint neighbours, in a fixed order. Budget exhaustion
+// always leaves a fully scored legal candidate; no unscored fit can win.
+fn neighbours(
+    px: &[[u8; 4]; 16],
+    trans: Option<u8>,
+    best: &mut (u32, u16, u16, u32),
+    budget: usize,
+) {
+    let mut left = budget.min(12);
+    for direction in [-1, 1] {
+        for endpoint in 0..2 {
+            for channel in 0..3 {
+                if left == 0 || best.0 == 0 {
+                    return;
+                }
+                left -= 1;
+                let (a, b) = (best.1, best.2);
+                let mut x = components(if endpoint == 0 { a } else { b });
+                x[channel] += if endpoint == 0 { direction } else { -direction };
+                let limit = if channel == 1 { 63 } else { 31 };
+                if (0..=limit).contains(&x[channel]) {
+                    if endpoint == 0 {
+                        candidate(px, trans, pack(x), b, best);
+                    } else {
+                        candidate(px, trans, a, pack(x), best);
+                    }
+                }
+            }
+        }
+    }
+}
 // Prefix sums make every ordered cluster fit independent of block size.
 fn fit(
     prefix: &[[i64; 3]; 17],
@@ -374,45 +406,8 @@ pub fn encode(px: &[[u8; 4]; 16], effort: Effort, policy: AlphaPolicy) -> [u8; 8
             b,
             u32::from_le_bytes(initial[4..].try_into().unwrap()),
         );
-        if best.0 > 16 {
-            for endpoint in 0..2 {
-                for channel in 0..3 {
-                    let delta = if endpoint == 0 { -1 } else { 1 };
-                    let mut x = components(if endpoint == 0 { a } else { b });
-                    x[channel] += delta;
-                    let limit = if channel == 1 { 63 } else { 31 };
-                    if (0..=limit).contains(&x[channel]) {
-                        let changed = pack(x);
-                        if endpoint == 0 {
-                            candidate(px, trans, changed, b, &mut best);
-                        } else {
-                            candidate(px, trans, a, changed, &mut best);
-                        }
-                    }
-                }
-            }
-        }
-        // Corpus sweep: the largest positive error bins have residual
-        // above 1024 and a maximum channel span of 64..159.
-        let span = (0..3).map(|c| hi[c] - lo[c]).max().unwrap();
-        if best.0 > 1024 && (64..160).contains(&span) {
-            for endpoint in 0..2 {
-                for channel in 0..3 {
-                    let delta = if endpoint == 0 { 1 } else { -1 };
-                    let mut x = components(if endpoint == 0 { best.1 } else { best.2 });
-                    x[channel] += delta;
-                    let limit = if channel == 1 { 63 } else { 31 };
-                    if (0..=limit).contains(&x[channel]) {
-                        let (a, b) = (best.1, best.2);
-                        if endpoint == 0 {
-                            candidate(px, trans, pack(x), b, &mut best);
-                        } else {
-                            candidate(px, trans, a, pack(x), &mut best);
-                        }
-                    }
-                }
-            }
-        }
+        let units = crate::budget::difficulty(px, error, 3, trans);
+        neighbours(px, trans, &mut best, 6 * units);
         let mut out = [0u8; 8];
         out[..2].copy_from_slice(&best.1.to_le_bytes());
         out[2..4].copy_from_slice(&best.2.to_le_bytes());

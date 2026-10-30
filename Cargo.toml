@@ -3,10 +3,10 @@ name = "texture-compressor"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "Encode pixels into GPU block-compressed textures"
+description = "Deterministic BC1, BC3, BC4, BC5 and BC7 texture encoding for native and WebAssembly"
 repository = "https://github.com/Tavrin/texture-compressor"
 readme = "README.md"
-keywords = ["texture", "compression", "bc7"]
+keywords = ["texture", "compression", "bc7", "no-std", "wasm"]
 categories = ["encoding", "graphics"]
 rust-version = "1.98"
 include = ["src/**", "tests/**", "examples/**", "build.rs", "README.md", "CHANGELOG.md", "LICENSE-MIT", "LICENSE-APACHE"]
@@ -15,8 +15,12 @@ include = ["src/**", "tests/**", "examples/**", "build.rs", "README.md", "CHANGE
 path = "src/lib.rs"
 
 [features]
-default = []
-parallel = ["dep:rayon"]
+default = ["std", "simd"]
+std = []
+simd = []
+# Process-local forced backend for qualification; unsupported ISAs are rejected.
+simd-diagnostics = ["std", "simd"]
+parallel = ["std", "dep:rayon"]
 
 [dependencies]
 rayon = { version = "1.11", optional = true }

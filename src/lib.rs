@@ -1,47 +1,65 @@
+#![doc = include_str!("../README.md")]
+#![deny(missing_docs)]
 #![no_std]
-#![forbid(unsafe_code)]
+#![cfg_attr(not(feature = "simd"), forbid(unsafe_code))]
+#![deny(unsafe_code)]
 extern crate alloc;
-#[cfg(feature = "parallel")]
+#[cfg(feature = "std")]
 extern crate std;
 use alloc::vec::Vec;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
+/// GPU block-compression format. BC4 and BC5 encode unsigned channels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
+    /// RGB with optional one-bit alpha, eight bytes per 4x4 block.
     Bc1,
+    /// RGB with a separate alpha channel, sixteen bytes per 4x4 block.
     Bc3,
+    /// Red channel, eight bytes per 4x4 block.
     Bc4,
+    /// Red and green channels, sixteen bytes per 4x4 block.
     Bc5,
-    /// BC7. The Fast preset is qualified; Balanced and Quality are still experimental.
+    /// RGBA, sixteen bytes per 4x4 block.
     Bc7,
 }
+/// Encoder search preset.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Effort {
-    /// Fastest search. BC7 fits each subset along its principal axis, refines
+    /// Limited search. BC7 fits each subset along its principal axis, refines
     /// endpoints by least squares, and searches further only where a block's
     /// error stays high or its colours are few.
     Fast,
-    /// Balanced search. For BC1, BC3, BC4 and BC5 it costs fewer instructions than
-    /// common reference encoders at higher quality; for BC7 it is still experimental.
+    /// Intermediate search budget between Fast and Quality.
     Balanced,
+    /// Broader search. BC7 adds more partition and rotation candidates,
+    /// including three-subset modes, and extra endpoint refinement.
     Quality,
 }
+/// Alpha handling; punch-through is supported only for BC1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AlphaPolicy {
     /// Opaque BC1 blocks. BC3 and BC7 preserve input alpha with this policy.
     Opaque,
+    /// Encode BC1 texels below the threshold as transparent.
     PunchThrough {
+        /// Alpha values strictly below this byte are transparent.
         threshold: u8,
     },
 }
+/// Format, search preset and alpha policy used by an encode operation.
 #[derive(Clone, Copy, Debug)]
 pub struct Settings {
+    /// Output block format.
     pub format: Format,
+    /// Search preset.
     pub effort: Effort,
+    /// Alpha policy; defaults to opaque BC1 and preserved BC3/BC7 alpha.
     pub alpha: AlphaPolicy,
 }
 impl Settings {
+    /// Create settings with [`AlphaPolicy::Opaque`].
     pub fn new(format: Format, effort: Effort) -> Self {
         Self {
             format,
@@ -50,16 +68,25 @@ impl Settings {
         }
     }
 }
+/// Image validation or encoding failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
+    /// Width or height is zero.
     EmptyImage,
+    /// The byte stride is smaller than a complete input row.
     InvalidStride,
+    /// The input slice does not contain every visible texel.
     ShortInput,
+    /// The output slice is smaller than [`encoded_len`].
     ShortOutput,
+    /// Image or output size cannot be represented.
     Overflow,
+    /// Reserving the output buffer failed.
     AllocationFailed,
+    /// Input channels or alpha policy are incompatible with the output format.
     UnsupportedPolicy,
 }
+/// Borrowed strided R8, RG8 or RGBA8 image with validated dimensions and storage.
 #[derive(Clone, Copy, Debug)]
 pub struct ImageView<'a> {
     data: &'a [u8],
@@ -69,18 +96,32 @@ pub struct ImageView<'a> {
     channels: usize,
 }
 impl<'a> ImageView<'a> {
+    /// Image width in texels.
     pub fn width(&self) -> u32 {
         self.width
     }
+    /// Image height in texels.
     pub fn height(&self) -> u32 {
         self.height
     }
+    /// Borrow RGBA8 pixels with a byte stride.
+    ///
+    /// Fails for zero dimensions, a short stride or input slice, or size overflow.
+    /// Padding after the final visible row is not required.
     pub fn rgba8(data: &'a [u8], width: u32, height: u32, stride: usize) -> Result<Self, Error> {
         Self::new(data, width, height, stride, 4)
     }
+    /// Borrow single-channel unsigned pixels with a byte stride.
+    ///
+    /// Fails for zero dimensions, a short stride or input slice, or size overflow.
+    /// Padding after the final visible row is not required.
     pub fn r8(data: &'a [u8], width: u32, height: u32, stride: usize) -> Result<Self, Error> {
         Self::new(data, width, height, stride, 1)
     }
+    /// Borrow two-channel unsigned pixels with a byte stride.
+    ///
+    /// Fails for zero dimensions, a short stride or input slice, or size overflow.
+    /// Padding after the final visible row is not required.
     pub fn rg8(data: &'a [u8], width: u32, height: u32, stride: usize) -> Result<Self, Error> {
         Self::new(data, width, height, stride, 2)
     }
@@ -116,6 +157,10 @@ impl<'a> ImageView<'a> {
         })
     }
 }
+/// Output bytes required for the format and dimensions, rounding up to 4x4 blocks.
+///
+/// Returns [`Error::EmptyImage`] for zero dimensions or [`Error::Overflow`]
+/// if the output size exceeds the supported address range.
 pub fn encoded_len(format: Format, width: u32, height: u32) -> Result<usize, Error> {
     if width == 0 || height == 0 {
         return Err(Error::EmptyImage);
@@ -138,6 +183,12 @@ fn block_size(format: Format) -> usize {
     }
 }
 
+/// Allocate and encode an image into blocks in row order.
+///
+/// BC1/BC3/BC7 require RGBA8; BC4 reads R from any view; BC5 reads R/G
+/// from RG8 or RGBA8. Partial blocks replicate the nearest edge texel.
+/// Returns validation errors described by [`encode_into`], size overflow,
+/// or [`Error::AllocationFailed`].
 pub fn encode(image: ImageView<'_>, settings: &Settings) -> Result<Vec<u8>, Error> {
     let len = encoded_len(settings.format, image.width, image.height)?;
     let mut out = Vec::new();
@@ -147,6 +198,12 @@ pub fn encode(image: ImageView<'_>, settings: &Settings) -> Result<Vec<u8>, Erro
     encode_into(image, settings, &mut out)?;
     Ok(out)
 }
+/// Encode into the first [`encoded_len`] bytes of `out`, leaving the rest untouched.
+///
+/// Uses the channel mapping and edge replication described by [`encode`].
+/// Returns [`Error::UnsupportedPolicy`] for incompatible channels or a
+/// punch-through policy outside BC1, [`Error::ShortOutput`] for insufficient
+/// output space, or [`Error::Overflow`] for an unrepresentable output size.
 pub fn encode_into(image: ImageView<'_>, settings: &Settings, out: &mut [u8]) -> Result<(), Error> {
     let (bw, len) = validate(image, settings, out.len())?;
     for (by, row) in out[..len]
@@ -162,6 +219,7 @@ pub fn encode_into(image: ImageView<'_>, settings: &Settings, out: &mut [u8]) ->
 ///
 /// Requires the `parallel` feature. Each block row is independent and produces
 /// exactly the same bytes as [`encode_into`], including for padded edges.
+/// Channel requirements, output layout and errors are the same as [`encode_into`].
 #[cfg(feature = "parallel")]
 pub fn encode_into_parallel(
     image: ImageView<'_>,
@@ -179,6 +237,9 @@ pub fn encode_into_parallel(
 }
 
 /// Allocate and encode using the current Rayon pool.
+///
+/// Requires `parallel`. Input requirements, output layout and errors match
+/// [`encode`]; output bytes match sequential encoding.
 #[cfg(feature = "parallel")]
 pub fn encode_parallel(image: ImageView<'_>, settings: &Settings) -> Result<Vec<u8>, Error> {
     let len = encoded_len(settings.format, image.width, image.height)?;
@@ -209,6 +270,25 @@ fn validate(
 }
 
 fn encode_row(image: ImageView<'_>, settings: &Settings, by: usize, row: &mut [u8]) {
+    #[cfg(feature = "simd")]
+    if settings.format == Format::Bc7 && settings.effort != Effort::Fast {
+        let lanes = bc7::batch_width();
+        for (batch, dst) in row.chunks_mut(lanes * 16).enumerate() {
+            let mut blocks = [[[0u8; 4]; 16]; 8];
+            for (slot, block) in blocks.iter_mut().enumerate().take(dst.len() / 16) {
+                for y in 0..4 {
+                    for x in 0..4 {
+                        let px = ((batch * lanes + slot) * 4 + x).min(image.width as usize - 1);
+                        let py = (by * 4 + y).min(image.height as usize - 1);
+                        let off = py * image.stride + px * 4;
+                        block[y * 4 + x].copy_from_slice(&image.data[off..off + 4]);
+                    }
+                }
+            }
+            bc7::encode_batch(&blocks, dst, settings.effort);
+        }
+        return;
+    }
     for (bx, dst) in row
         .chunks_exact_mut(block_size(settings.format))
         .enumerate()
@@ -254,3 +334,4 @@ fn encode_row(image: ImageView<'_>, settings: &Settings, by: usize, row: &mut [u
 mod bc1;
 mod bc4;
 mod bc7;
+mod budget;

@@ -16,6 +16,17 @@
 use super::tables::ANCHOR2;
 use super::{put, solid_rgba, MASKS2};
 
+#[path = "bc7_search.rs"]
+mod search;
+
+#[path = "bc7_objective.rs"]
+mod objective;
+pub(super) use search::{encode_with, BALANCED, QUALITY};
+
+#[cfg(feature = "simd")]
+#[path = "bc7_simd/mod.rs"]
+pub(super) mod simd;
+
 type Block = [[u8; 4]; 16];
 type Pair = [[i32; 4]; 2];
 
@@ -151,6 +162,7 @@ struct Reps {
     list: [(u8, u8); 16],
     len: usize,
     of: [u8; 16],
+    expand: bool,
 }
 
 impl Reps {
@@ -160,6 +172,7 @@ impl Reps {
             list: [(0, 0); 16],
             len: 0,
             of: [0; 16],
+            expand: false,
         };
         let keys = px.map(u32::from_le_bytes);
         for (i, &key) in keys.iter().enumerate() {
@@ -168,6 +181,7 @@ impl Reps {
                 .find(|(j, _)| keys[usize::from(*j)] == key)
             {
                 Some(slot) => {
+                    r.expand = true;
                     slot.1 += 1;
                     r.of[i] = slot.0;
                 }
@@ -187,12 +201,39 @@ impl Reps {
             list: [(0, 0); 16],
             len: 0,
             of: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+            expand: false,
         };
         let mut m = mask;
         while m != 0 {
             r.list[r.len] = (m.trailing_zeros() as u8, 1);
             r.len += 1;
             m &= m - 1;
+        }
+        r
+    }
+
+    // Restrict full-block colour representatives to a subset. A representative
+    // may lie outside the subset, but has the same RGBA value as every pixel
+    // counted for it; selectors are expanded through the original mapping.
+    fn masked(&self, mask: u16) -> Self {
+        if !self.expand {
+            return Self::subset(mask);
+        }
+        let mut r = *self;
+        let mut counts = [0u8; 16];
+        let mut m = mask;
+        while m != 0 {
+            let i = m.trailing_zeros() as usize;
+            counts[usize::from(self.of[i])] += 1;
+            m &= m - 1;
+        }
+        r.len = 0;
+        for &(i, _) in &self.list[..self.len] {
+            let count = counts[usize::from(i)];
+            if count != 0 {
+                r.list[r.len] = (i, count);
+                r.len += 1;
+            }
         }
         r
     }
@@ -208,7 +249,6 @@ impl Reps {
 // one keeps opaque alpha exactly 255 in the modes that store alpha.
 fn quantize<const C0: usize, const C1: usize>(t: &Pair, prec: Prec, force_p1: bool) -> Pair {
     let table = &QUANT[prec.bits];
-    let mut d = [[255i32; 4]; 2];
     let quant_err = |k: usize, p: usize| -> i32 {
         let mut e = 0;
         for c in C0..C1 {
@@ -233,6 +273,17 @@ fn quantize<const C0: usize, const C1: usize>(t: &Pair, prec: Prec, force_p1: bo
             choice = [p, p];
         }
     }
+    quantize_with::<C0, C1>(t, prec, choice)
+}
+
+// Quantize endpoint targets with the given low bit per endpoint (2 for none).
+fn quantize_with<const C0: usize, const C1: usize>(
+    t: &Pair,
+    prec: Prec,
+    choice: [usize; 2],
+) -> Pair {
+    let table = &QUANT[prec.bits];
+    let mut d = [[255i32; 4]; 2];
     for k in 0..2 {
         for c in C0..C1 {
             d[k][c] = i32::from(table[choice[k]][t[k][c] as usize]);
@@ -258,11 +309,44 @@ fn select<const C0: usize, const C1: usize>(
     idx: &mut [u8; 16],
     limit: u32,
 ) -> u32 {
-    let n = lv.w.len();
-    let mut pal = [[0i32; 4]; 16];
-    for (j, &w) in lv.w.iter().enumerate() {
+    #[cfg(feature = "simd")]
+    if let Some(err) = simd::select::<C0, C1>(px, reps, d, lv, idx, limit, None) {
+        return err;
+    }
+    select_scalar::<C0, C1>(px, reps, d, lv, idx, limit)
+}
+
+#[inline]
+fn select_scalar<const C0: usize, const C1: usize>(
+    px: &Block,
+    reps: &Reps,
+    d: &Pair,
+    lv: &Levels,
+    idx: &mut [u8; 16],
+    limit: u32,
+) -> u32 {
+    match lv.w.len() {
+        4 => select_palette::<C0, C1, 4>(px, reps, d, lv, idx, limit),
+        8 => select_palette::<C0, C1, 8>(px, reps, d, lv, idx, limit),
+        16 => select_palette::<C0, C1, 16>(px, reps, d, lv, idx, limit),
+        _ => unreachable!(),
+    }
+}
+
+fn select_palette<const C0: usize, const C1: usize, const N: usize>(
+    px: &Block,
+    reps: &Reps,
+    d: &Pair,
+    lv: &Levels,
+    idx: &mut [u8; 16],
+    limit: u32,
+) -> u32 {
+    let n = N;
+    let mut pal = [[0i32; 4]; N];
+    for (j, entry) in pal.iter_mut().enumerate() {
+        let w = lv.w[j];
         for c in C0..C1 {
-            pal[j][c] = ((64 - w) * d[0][c] + w * d[1][c] + 32) >> 6;
+            entry[c] = ((64 - w) * d[0][c] + w * d[1][c] + 32) >> 6;
         }
     }
     let mut dir = [0i32; 4];
@@ -303,8 +387,10 @@ fn select<const C0: usize, const C1: usize>(
             return err;
         }
     }
-    for i in 0..16 {
-        idx[i] = idx[usize::from(reps.of[i])];
+    if reps.expand {
+        for i in 0..16 {
+            idx[i] = idx[usize::from(reps.of[i])];
+        }
     }
     err
 }
@@ -327,20 +413,33 @@ fn axis_targets<const C0: usize, const C1: usize>(px: &Block, reps: &Reps) -> Pa
         }
     }
     let mut cov = [[0f32; 4]; 4];
-    let mut top = C0;
     for c in C0..C1 {
         for e in c..C1 {
             let v = (n * prod[c][e] - s[c] * s[e]) as f32;
             cov[c][e] = v;
             cov[e][c] = v;
         }
-        if cov[c][c] > cov[top][top] {
-            top = c;
-        }
     }
     let mut mean = [0f32; 4];
     for c in C0..C1 {
         mean[c] = s[c] as f32 / n as f32;
+    }
+    axis_endpoints::<C0, C1>(px, reps, &mean, &cov)
+}
+
+// Project onto an axis from previously computed moments. Covariance uses
+// the unnormalized integer moment scale, matching fresh subset fits exactly.
+fn axis_endpoints<const C0: usize, const C1: usize>(
+    px: &Block,
+    reps: &Reps,
+    mean: &[f32; 4],
+    cov: &[[f32; 4]; 4],
+) -> Pair {
+    let mut top = C0;
+    for c in C0..C1 {
+        if cov[c][c] > cov[top][top] {
+            top = c;
+        }
     }
     let mut t = [[0i32; 4]; 2];
     if cov[top][top] <= 0.0 {
@@ -444,42 +543,53 @@ fn polish<const C0: usize, const C1: usize>(
     prec: Prec,
     lv: &Levels,
 ) -> bool {
+    #[cfg(feature = "simd")]
+    if let Some(changed) = simd::polish::<C0, C1>(px, reps, f, prec, lv, None) {
+        return changed;
+    }
     let n = prec.bits as u32;
     let step = if prec.pbit == PBit::None { 1 } else { 2 };
     let max = (1i32 << n) - 1;
-    let channel_err = |c: usize, a: i32, b: i32| -> u32 {
-        let mut e = 0;
-        for (i, count) in reps.iter() {
-            let w = lv.w[usize::from(f.idx[i])];
-            let x = i32::from(px[i][c]) - (((64 - w) * a + w * b + 32) >> 6);
-            e += x * x * count;
-        }
-        e as u32
-    };
     let mut fixed = 0u32;
     let mut d = f.d;
     for c in C0..C1 {
         let x0 = d[0][c] >> (8 - n);
         let x1 = d[1][c] >> (8 - n);
-        let mut best = (channel_err(c, d[0][c], d[1][c]), d[0][c], d[1][c]);
-        for (a, b) in [
+        let mut endpoints = [[d[0][c], d[1][c]]; 5];
+        for (j, (a, b)) in [
             (x0 - step, x1),
             (x0 + step, x1),
             (x0, x1 - step),
             (x0, x1 + step),
-        ] {
-            if !(0..=max).contains(&a) || !(0..=max).contains(&b) {
-                continue;
-            }
-            let (va, vb) = (expand(a as u32, n) as i32, expand(b as u32, n) as i32);
-            let e = channel_err(c, va, vb);
-            if e < best.0 {
-                best = (e, va, vb);
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if (0..=max).contains(&a) && (0..=max).contains(&b) {
+                endpoints[j + 1] = [expand(a as u32, n) as i32, expand(b as u32, n) as i32];
             }
         }
-        fixed += best.0;
-        d[0][c] = best.1;
-        d[1][c] = best.2;
+        // The five independent sums share selector, source and multiplicity
+        // loads. Invalid moves repeat the centre and cannot win a strict tie.
+        let mut errors = [0u32; 5];
+        for (i, count) in reps.iter() {
+            let w = lv.w[usize::from(f.idx[i])];
+            let source = i32::from(px[i][c]);
+            for j in 0..5 {
+                let [a, b] = endpoints[j];
+                let x = source - (((64 - w) * a + w * b + 32) >> 6);
+                errors[j] += (x * x * count) as u32;
+            }
+        }
+        let mut best = 0;
+        for j in 1..5 {
+            if errors[j] < errors[best] {
+                best = j;
+            }
+        }
+        fixed += errors[best];
+        d[0][c] = endpoints[best][0];
+        d[1][c] = endpoints[best][1];
     }
     if fixed >= f.err {
         return false;
@@ -523,6 +633,7 @@ fn axis_search<const C0: usize, const C1: usize>(
     for _ in 0..rounds {
         let centre = f.d;
         let mut best = (f.err, centre);
+        let mut best_idx = f.idx;
         for (a, b) in [
             (-1, -1),
             (-1, 0),
@@ -546,13 +657,17 @@ fn axis_search<const C0: usize, const C1: usize>(
             let e = select::<C0, C1>(px, reps, &d, lv, &mut scratch, best.0);
             if e < best.0 {
                 best = (e, d);
+                best_idx = scratch;
             }
         }
         if best.0 == f.err {
             break;
         }
         f.d = best.1;
-        f.err = select::<C0, C1>(px, reps, &f.d, lv, &mut f.idx, u32::MAX);
+        // An improving bounded select completed every representative and
+        // expanded duplicate selectors, so its indices are already final.
+        f.err = best.0;
+        f.idx = best_idx;
     }
 }
 
@@ -572,6 +687,26 @@ fn fit<const C0: usize, const C1: usize>(
         idx: [0; 16],
     };
     best.err = select::<C0, C1>(px, reps, &d, lv, &mut best.idx, u32::MAX);
+    improve::<C0, C1>(px, reps, &mut best, prec, lv, iters, rounds, force_p1);
+    best
+}
+
+// Up to `iters` least-squares passes while the error falls, then up to
+// `rounds` polish passes.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the fit parameters are independent knobs shared by every mode"
+)]
+fn improve<const C0: usize, const C1: usize>(
+    px: &Block,
+    reps: &Reps,
+    best: &mut Fit,
+    prec: Prec,
+    lv: &Levels,
+    iters: usize,
+    rounds: usize,
+    force_p1: bool,
+) {
     for _ in 0..iters {
         if best.err == 0 {
             break;
@@ -588,14 +723,13 @@ fn fit<const C0: usize, const C1: usize>(
         if err >= best.err {
             break;
         }
-        best = Fit { err, d, idx };
+        *best = Fit { err, d, idx };
     }
     for _ in 0..rounds {
-        if best.err == 0 || !polish::<C0, C1>(px, reps, &mut best, prec, lv) {
+        if best.err == 0 || !polish::<C0, C1>(px, reps, best, prec, lv) {
             break;
         }
     }
-    best
 }
 
 // Flip a subset so its anchor selector has a clear high bit.
@@ -840,9 +974,9 @@ fn partition_estimates<const CH: usize>(px: &Block) -> [(f32, f32); 64] {
 
 // The `count` partitions with the lowest estimate for a mode with `levels`
 // selectors per subset, best first.
-fn best_partitions(est: &[(f32, f32); 64], levels: f32, count: usize) -> [(f32, usize); 4] {
+fn best_partitions(est: &[(f32, f32); 64], levels: f32, count: usize) -> [(f32, usize); 16] {
     let step = 1.0 / ((levels - 1.0) * (levels - 1.0));
-    let mut top = [(f32::MAX, 0usize); 4];
+    let mut top = [(f32::MAX, 0usize); 16];
     for (p, &(res, var)) in est.iter().enumerate() {
         let e = res + var * step;
         if e < top[count - 1].0 {
@@ -857,15 +991,22 @@ fn best_partitions(est: &[(f32, f32); 64], levels: f32, count: usize) -> [(f32, 
     top
 }
 
-fn fit_partition(px: &Block, mode: usize, partition: usize, opaque: bool) -> [Fit; 2] {
+fn fit_partition(
+    px: &Block,
+    mode: usize,
+    partition: usize,
+    opaque: bool,
+    iters: usize,
+    rounds: usize,
+) -> [Fit; 2] {
     let m1 = MASKS2[partition][0];
     [!m1, m1].map(|mask| {
         let reps = Reps::subset(mask);
         match mode {
-            1 => fit::<0, 3>(px, &reps, P1, &L3, 1, 0, false),
-            3 => fit::<0, 3>(px, &reps, P3, &L2, 1, 0, false),
+            1 => fit::<0, 3>(px, &reps, P1, &L3, iters, rounds, false),
+            3 => fit::<0, 3>(px, &reps, P3, &L2, iters, rounds, false),
             _ => {
-                let mut f = fit::<0, 4>(px, &reps, P7, &L2, 1, 0, opaque);
+                let mut f = fit::<0, 4>(px, &reps, P7, &L2, iters, rounds, opaque);
                 if opaque {
                     f.d[0][3] = 255;
                     f.d[1][3] = 255;
@@ -988,7 +1129,7 @@ pub(super) fn encode(px: &Block) -> [u8; 16] {
             if e >= best_err as f32 {
                 continue;
             }
-            let s = fit_partition(px, mode, partition, opaque);
+            let s = fit_partition(px, mode, partition, opaque, 1, 0);
             let err = s[0].err + s[1].err;
             if err < best_err {
                 best_err = err;
@@ -997,6 +1138,38 @@ pub(super) fn encode(px: &Block) -> [u8; 16] {
         }
     }
     best
+}
+
+#[cfg(feature = "simd")]
+pub(super) fn encode_batch(blocks: &[Block; 8], out: &mut [u8], effort: crate::Effort) {
+    // Solid blocks return before using a seed, and nonopaque blocks use
+    // the separate visibility-aware fit. Avoid work for batches where no
+    // live block can consume the opaque seed.
+    let wants_seed = blocks[..out.len() / 16]
+        .iter()
+        .any(|block| block.iter().all(|p| p[3] == 255) && solid_rgba(block).is_none());
+    let seeds = if wants_seed {
+        simd::seed_batch(blocks)
+    } else {
+        None
+    };
+    let cfg = if effort == crate::Effort::Balanced {
+        &BALANCED
+    } else {
+        &QUALITY
+    };
+    for (slot, dst) in out.as_chunks_mut::<16>().0.iter_mut().enumerate() {
+        dst.copy_from_slice(&search::encode_seeded(
+            &blocks[slot],
+            cfg,
+            seeds.as_ref().map(|t| t[slot]),
+        ));
+    }
+}
+
+#[cfg(feature = "simd")]
+pub(super) fn batch_width() -> usize {
+    simd::width()
 }
 
 #[cfg(test)]
@@ -1017,6 +1190,36 @@ mod tests {
 
     // Every candidate's reported error is its decoded SSE, so mode choices
     // compare real errors; opaque blocks keep alpha exactly 255.
+    #[test]
+    fn masked_representatives_preserve_subset_fits() {
+        let mut state = 0x741e_5badu32;
+        for case in 0..512 {
+            let mut px = [[0; 4]; 16];
+            for i in 0..16 {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                px[i] = if i > 0 && case % 3 != 0 {
+                    px[(state as usize >> 16) % i]
+                } else {
+                    state.to_le_bytes()
+                };
+            }
+            let mask = (state as u16) | 1;
+            let original = Reps::subset(mask);
+            let compact = Reps::distinct(&px).masked(mask);
+            for (prec, levels) in [(P1, &L3), (P3, &L2), (P7, &L2)] {
+                let a = fit::<0, 4>(&px, &original, prec, levels, 2, 2, false);
+                let b = fit::<0, 4>(&px, &compact, prec, levels, 2, 2, false);
+                assert_eq!(a.err, b.err);
+                assert_eq!(a.d, b.d);
+                for i in 0..16 {
+                    if mask >> i & 1 != 0 {
+                        assert_eq!(a.idx[i], b.idx[i]);
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn fast_candidates_report_their_decoded_error() {
         let mut state = 0x2545_f491u32;
@@ -1073,7 +1276,7 @@ mod tests {
             }
             let partition = case % 64;
             for mode in [1, 3, 7] {
-                let s = fit_partition(&px, mode, partition, opaque && mode == 7);
+                let s = fit_partition(&px, mode, partition, opaque && mode == 7, 1, 0);
                 let block = pack2(mode, partition, s);
                 if mode == 7 || opaque {
                     assert_eq!(u64::from(s[0].err + s[1].err), decoded_sse(&px, &block));
