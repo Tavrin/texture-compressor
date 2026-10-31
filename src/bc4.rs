@@ -285,9 +285,324 @@ pub fn encode(pixels: &[[u8; 4]; 16], effort: Effort, channel: usize) -> [u8; 8]
     out
 }
 
+// Fast/Balanced need no endpoint search to satisfy the range-fit bound.
+// Assign exact nearest selectors without accumulating an unused SSE.
+#[inline]
+fn range_fit(pixels: &[[u8; 4]; 16], channel: usize) -> [u8; 8] {
+    let v = pixels.map(|p| p[channel]);
+    range_fit_values(&v)
+}
+
+#[inline(always)]
+pub(crate) fn range_fit_values(v: &[u8; 16]) -> [u8; 8] {
+    #[cfg(all(feature = "simd", feature = "std", target_arch = "x86_64"))]
+    if let Some(encoder) = crate::bc7::range_encoder_sse41() {
+        return encoder.encode(v);
+    }
+    #[cfg(all(feature = "simd", feature = "std", target_arch = "x86_64"))]
+    if let Some(encoded) = crate::bc7::range_channel(v) {
+        return encoded;
+    }
+    #[cfg(all(feature = "simd", target_arch = "x86_64"))]
+    let (min, max) = crate::bc7::byte_bounds(v);
+    #[cfg(not(all(feature = "simd", target_arch = "x86_64")))]
+    let (min, max) = scalar_range_bounds(v);
+    if min == max {
+        return [max, min, 0, 0, 0, 0, 0, 0];
+    }
+    let bits = range_selectors(v, min, max);
+    pack((0, max, min, bits))
+}
+
+#[cfg(not(all(feature = "simd", target_arch = "x86_64")))]
+fn scalar_range_bounds(v: &[u8; 16]) -> (u8, u8) {
+    // A fixed tree exposes independent byte min/max operations to SIMD.
+    let lo8: [u8; 8] = core::array::from_fn(|i| v[i].min(v[i + 8]));
+    let hi8: [u8; 8] = core::array::from_fn(|i| v[i].max(v[i + 8]));
+    let lo4: [u8; 4] = core::array::from_fn(|i| lo8[i].min(lo8[i + 4]));
+    let hi4: [u8; 4] = core::array::from_fn(|i| hi8[i].max(hi8[i + 4]));
+    let min = lo4[0].min(lo4[2]).min(lo4[1].min(lo4[3]));
+    let max = hi4[0].max(hi4[2]).max(hi4[1].max(hi4[3]));
+    (min, max)
+}
+
+// For spans up to seven, every source byte in the range is represented
+// exactly. These are the smallest selectors for each offset from the minimum.
+pub(crate) const NARROW_SELECTORS: [[u8; 8]; 8] = [
+    [0; 8],
+    [1, 0, 0, 0, 0, 0, 0, 0],
+    [1, 3, 0, 0, 0, 0, 0, 0],
+    [1, 5, 3, 0, 0, 0, 0, 0],
+    [1, 6, 4, 2, 0, 0, 0, 0],
+    [1, 6, 5, 4, 2, 0, 0, 0],
+    [1, 7, 6, 4, 3, 2, 0, 0],
+    [1, 7, 6, 5, 4, 3, 2, 0],
+];
+
+pub(crate) const RANGE_BOUND_OFFSETS: [[u8; 7]; 256] = range_bound_offsets();
+
+const fn range_bound_offsets() -> [[u8; 7]; 256] {
+    let mut table = [[0; 7]; 256];
+    let weights = [9363u32, 18724, 28086, 37450, 46812, 56173];
+    let mut index = 0;
+    let mut span = 0;
+    while index < 256 {
+        let mut p = [0; 6];
+        let mut i = 0;
+        while i < 6 {
+            p[i] = (weights[i] * span + 32768) >> 16;
+            i += 1;
+        }
+        // Every used offset (span > 7) is <= span <= 255.
+        table[index] = [
+            (p[0] / 2 + 1).to_le_bytes()[0],
+            (p[0] + p[1]).div_ceil(2).to_le_bytes()[0],
+            (p[1] + p[2]).div_ceil(2).to_le_bytes()[0],
+            (p[2] + p[3]).div_ceil(2).to_le_bytes()[0],
+            (p[3] + p[4]).div_ceil(2).to_le_bytes()[0],
+            (p[4] + p[5]).div_ceil(2).to_le_bytes()[0],
+            (p[5] + span).div_ceil(2).to_le_bytes()[0],
+        ];
+        index += 1;
+        span += 1;
+    }
+    table
+}
+
+fn range_selectors(v: &[u8; 16], min: u8, max: u8) -> u64 {
+    let selectors = if max - min <= 7 {
+        let table = &NARROW_SELECTORS[usize::from(max - min)];
+        #[cfg(all(feature = "simd", feature = "std", target_arch = "x86_64"))]
+        if let Some(selectors) = crate::bc7::byte_lookup(v, min, table) {
+            return pack_selectors(selectors);
+        }
+        v.map(|x| table[usize::from(x - min)])
+    } else {
+        // Decoded levels are min + round(weight * span / 65536), so all
+        // boundary offsets depend only on the span. The table preserves the
+        // exact palette rounding and smallest-selector midpoint ties.
+        let bounds = RANGE_BOUND_OFFSETS[usize::from(max - min)].map(|offset| min + offset);
+        #[cfg(all(feature = "simd", feature = "std", target_arch = "x86_64"))]
+        if let Some(selectors) = crate::bc7::byte_search(v, &bounds) {
+            return pack_selectors(selectors);
+        }
+        // Independent comparisons let the compiler vectorize across texels.
+        v.map(|x| {
+            let q = u8::from(x >= bounds[0])
+                + u8::from(x >= bounds[1])
+                + u8::from(x >= bounds[2])
+                + u8::from(x >= bounds[3])
+                + u8::from(x >= bounds[4])
+                + u8::from(x >= bounds[5])
+                + u8::from(x >= bounds[6]);
+            if q == 0 {
+                1
+            } else if q == 7 {
+                0
+            } else {
+                8 - q
+            }
+        })
+    };
+    pack_selectors(selectors)
+}
+
+fn pack_selectors(selectors: [u8; 16]) -> u64 {
+    // Compact eight three-bit selectors from byte positions to 24 bits,
+    // then concatenate the two halves. Explicit LE loads are portable.
+    fn compact(mut x: u64) -> u64 {
+        x = (x | (x >> 5)) & 0x003f_003f_003f_003f;
+        x = (x | (x >> 10)) & 0x0000_0fff_0000_0fff;
+        (x | (x >> 20)) & 0x00ff_ffff
+    }
+    compact(u64::from_le_bytes(core::array::from_fn(|i| selectors[i])))
+        | (compact(u64::from_le_bytes(core::array::from_fn(|i| {
+            selectors[i + 8]
+        }))) << 24)
+}
+
+// Keep the legacy encoder isolated so opt-in fitting cannot change its bytes.
+pub fn encode_with_fit(
+    pixels: &[[u8; 4]; 16],
+    effort: Effort,
+    channel: usize,
+    fit: crate::Bc45Fit,
+) -> [u8; 8] {
+    if fit == crate::Bc45Fit::SquaredError {
+        return encode(pixels, effort, channel);
+    }
+    if effort != Effort::Quality {
+        return range_fit(pixels, channel);
+    }
+    encode_peak_quality(pixels, channel)
+}
+
+// Keep the broad search's stack frame out of direct range fitting.
+#[inline(never)]
+fn encode_peak_quality(pixels: &[[u8; 4]; 16], channel: usize) -> [u8; 8] {
+    let v = pixels.map(|p| p[channel]);
+    let min = *v.iter().min().unwrap();
+    let max = *v.iter().max().unwrap();
+    let mut best = (u32::MAX, 0, 0, 0);
+    evaluate_balanced(&v, max, min, &mut best);
+    let peak = peak_error(&v, &best);
+    let legacy = encode(pixels, Effort::Quality, channel);
+    if best.0 == 0 {
+        return pack(best);
+    }
+    let mut candidate = (u32::MAX, 0, 0, 0);
+    evaluate_balanced(&v, legacy[0], legacy[1], &mut candidate);
+    if peak_error(&v, &candidate) <= peak {
+        best = best.min(candidate);
+    }
+    // Search both the range and preset fits; fixed work, integer tie breaks.
+    for (a, b) in [(max, min), (legacy[0], legacy[1]), (min, max)] {
+        for da in -3..=3 {
+            for db in -3..=3 {
+                let a = (i32::from(a) + da).clamp(0, 255) as u8;
+                let b = (i32::from(b) + db).clamp(0, 255) as u8;
+                let p = palette(a, b);
+                let (bounds, indices, n) = thresholds(&p, a, b);
+                let mut err = 0;
+                let mut bits = 0;
+                for (i, &x) in v.iter().enumerate() {
+                    let (d, j) = nearest(&p, &bounds, &indices, n, x);
+                    if d > peak * peak {
+                        err = u32::MAX;
+                        break;
+                    }
+                    err += d;
+                    if err > best.0 {
+                        break;
+                    }
+                    bits |= (j as u64) << (3 * i);
+                }
+                best = best.min((err, a, b, bits));
+            }
+        }
+    }
+    pack(best)
+}
+// BC5's two byte fits share an additional worst-normal score. This does not
+// convert the input: it only rejects a refinement of the unsigned XY range fit.
+pub fn encode_pair(pixels: &[[u8; 4]; 16], effort: Effort, fit: crate::Bc45Fit) -> [u8; 16] {
+    let mut out = [0; 16];
+    out[..8].copy_from_slice(&encode_with_fit(pixels, effort, 0, fit));
+    out[8..].copy_from_slice(&encode_with_fit(pixels, effort, 1, fit));
+    if fit == crate::Bc45Fit::SquaredError || effort != Effort::Quality {
+        return out;
+    }
+    let mut range = [0; 16];
+    for c in 0..2 {
+        let v = pixels.map(|p| p[c]);
+        let mut seed = (u32::MAX, 0, 0, 0);
+        evaluate_balanced(
+            &v,
+            *v.iter().max().unwrap(),
+            *v.iter().min().unwrap(),
+            &mut seed,
+        );
+        range[c * 8..c * 8 + 8].copy_from_slice(&pack(seed));
+    }
+    if out != range && normal_score(pixels, &out) < normal_score(pixels, &range) {
+        return range;
+    }
+    out
+}
+fn normal_score(pixels: &[[u8; 4]; 16], block: &[u8; 16]) -> i64 {
+    let p = [palette(block[0], block[1]), palette(block[8], block[9])];
+    let bits = [
+        u64::from_le_bytes(block[..8].try_into().unwrap()) >> 16,
+        u64::from_le_bytes(block[8..].try_into().unwrap()) >> 16,
+    ];
+    let mut worst = i64::MAX;
+    for (i, source) in pixels.iter().enumerate() {
+        let a = normal(source[0], source[1]);
+        let b = normal(
+            p[0][((bits[0] >> (i * 3)) & 7) as usize] as u8,
+            p[1][((bits[1] >> (i * 3)) & 7) as usize] as u8,
+        );
+        let dot: i64 = (0..3).map(|c| a[c] * b[c]).sum();
+        let aa: i64 = a.iter().map(|x| x * x).sum();
+        let bb: i64 = b.iter().map(|x| x * x).sum();
+        // Signed cosine squared is monotone in cosine on [-1,1]. The
+        // 40-bit score and 12 fractional coordinate bits avoid floating point.
+        // |dot| <= 2*(255*4096)^2; its square shifted by 40 fits u128.
+        let magnitude = u128::from(dot.unsigned_abs());
+        let score = (((magnitude * magnitude) << 40) / (aa as u128 * bb as u128)) as i64;
+        worst = worst.min(if dot < 0 { -score } else { score });
+    }
+    worst
+}
+fn normal(r: u8, g: u8) -> [i64; 3] {
+    let x = (2 * i64::from(r) - 255) * 4096;
+    let y = (2 * i64::from(g) - 255) * 4096;
+    let z2 = ((255i64 * 4096).pow(2) - x * x - y * y).max(0) as u64;
+    [x, y, z2.isqrt() as i64]
+}
+
+fn pack(fit: (u32, u8, u8, u64)) -> [u8; 8] {
+    let mut out = [0; 8];
+    out[0] = fit.1;
+    out[1] = fit.2;
+    out[2..].copy_from_slice(&fit.3.to_le_bytes()[..6]);
+    out
+}
+
+fn peak_error(v: &[u8; 16], fit: &(u32, u8, u8, u64)) -> u32 {
+    let p = palette(fit.1, fit.2);
+    v.iter()
+        .enumerate()
+        .map(|(i, &x)| (i32::from(x) - p[((fit.3 >> (3 * i)) & 7) as usize]).unsigned_abs())
+        .max()
+        .unwrap()
+}
+
 #[cfg(test)]
 mod threshold_tests {
     use super::*;
+    #[test]
+    fn range_fit_matches_oracle_for_all_endpoint_pairs() {
+        for a in 0..=255u8 {
+            for b in 0..=255u8 {
+                let v = core::array::from_fn(|i| if i % 2 == 0 { a } else { b });
+                let mut oracle = (u32::MAX, 0, 0, 0);
+                evaluate_balanced(&v, a.max(b), a.min(b), &mut oracle);
+                assert_eq!(range_fit_values(&v), pack(oracle), "{a} {b}");
+            }
+        }
+    }
+
+    #[test]
+    fn range_selectors_match_generic_evaluation() {
+        for min in 0..=255u8 {
+            for max in min..=255u8 {
+                for base in (usize::from(min)..=usize::from(max)).step_by(16) {
+                    let v = core::array::from_fn(|i| (base + i).min(usize::from(max)) as u8);
+                    let mut oracle = (u32::MAX, 0, 0, 0);
+                    evaluate_balanced(&v, max, min, &mut oracle);
+                    assert_eq!(
+                        range_selectors(&v, min, max),
+                        oracle.3,
+                        "{min} {max} {base}"
+                    );
+                    for (lo_slot, hi_slot) in [(0, 15), (1, 14)] {
+                        let mut block = v;
+                        block[lo_slot] = min;
+                        block[hi_slot] = max;
+                        let mut fit_oracle = (u32::MAX, 0, 0, 0);
+                        evaluate_balanced(&block, max, min, &mut fit_oracle);
+                        assert_eq!(
+                            range_fit_values(&block),
+                            pack(fit_oracle),
+                            "{min} {max} {base}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn all_endpoints_and_values_match_brute_force() {
         for a in 0..=255u8 {

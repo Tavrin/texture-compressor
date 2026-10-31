@@ -14,14 +14,43 @@ fn main() {
         Format::Bc7,
     ] {
         for effort in [Effort::Fast, Effort::Balanced, Effort::Quality] {
-            let settings = Settings {
-                format,
-                effort,
-                alpha: AlphaPolicy::Opaque,
-            };
+            let settings = Settings::new(format, effort).with_alpha(AlphaPolicy::Opaque);
             let data = encode(ImageView::rgba8(&pixels, 13, 7, 52).unwrap(), &settings).unwrap();
             for b in data {
                 print!("{b:02x}");
+            }
+            println!();
+        }
+    }
+    // Peak fitting covers all efforts, RGBA input, and replicated NPOT edges.
+    for format in [Format::Bc4, Format::Bc5] {
+        for effort in [Effort::Fast, Effort::Balanced, Effort::Quality] {
+            let mut settings = Settings::new(format, effort);
+            settings.bc45_fit = texture_compressor::Bc45Fit::PeakBounded;
+            let data = encode(ImageView::rgba8(&pixels, 13, 7, 52).unwrap(), &settings).unwrap();
+            for byte in data {
+                print!("{byte:02x}");
+            }
+            println!();
+        }
+    }
+    // Narrow spans, constants, and fixed 0/255 entries exercise both BC4 modes.
+    for sample in 0..32u8 {
+        let mut rg = [0; 32];
+        for (i, p) in rg.as_chunks_mut::<2>().0.iter_mut().enumerate() {
+            p[0] = match sample % 4 {
+                0 => sample * 7,
+                1 => 120 + ((i * 7 + sample as usize) % 16) as u8,
+                2 => [0, 255, 80, 160][i % 4],
+                _ => (i as u8).wrapping_mul(47).wrapping_add(sample),
+            };
+            p[1] = 255 - p[0];
+        }
+        for effort in [Effort::Fast, Effort::Balanced, Effort::Quality] {
+            let mut settings = Settings::new(Format::Bc5, effort);
+            settings.bc45_fit = texture_compressor::Bc45Fit::PeakBounded;
+            for byte in encode(ImageView::rg8(&rg, 4, 4, 8).unwrap(), &settings).unwrap() {
+                print!("{byte:02x}");
             }
             println!();
         }
@@ -40,11 +69,7 @@ fn main() {
             AlphaPolicy::Opaque,
             AlphaPolicy::PunchThrough { threshold: 128 },
         ] {
-            let settings = Settings {
-                format: Format::Bc1,
-                effort,
-                alpha,
-            };
+            let settings = Settings::new(Format::Bc1, effort).with_alpha(alpha);
             let data = encode(ImageView::rgba8(&block, 4, 4, 16).unwrap(), &settings).unwrap();
             for byte in data {
                 print!("{byte:02x}");

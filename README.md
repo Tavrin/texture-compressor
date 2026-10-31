@@ -72,6 +72,39 @@ assert_eq!(blocks.len(), 16);
 # Ok::<(), texture_compressor::Error>(())
 ```
 
+### Bound BC4/BC5 peak byte error
+
+Call `Settings::with_bc45_fit(Bc45Fit::PeakBounded)` to opt in:
+
+```rust
+use texture_compressor::{encode, Bc45Fit, Effort, Format, ImageView, Settings};
+
+let xy = [128u8; 4 * 4 * 2];
+let settings = Settings::new(Format::Bc5, Effort::Balanced).with_bc45_fit(Bc45Fit::PeakBounded);
+let blocks = encode(ImageView::rg8(&xy, 4, 4, 8)?, &settings)?;
+# Ok::<(), texture_compressor::Error>(())
+```
+
+For each channel and block, this starts with maximum/minimum endpoints and
+nearest palette selectors. Fast and Balanced keep these endpoints and need no
+search or normal-angle guard. Quality searches for lower squared error without
+increasing that fit's maximum absolute byte error, using the preset's fit and a
+fixed endpoint neighborhood. The bound refers to the
+unsigned integer BC4 reconstruction, including replicated edge texels.
+It is relative to this range fit, rather than a universal bound against other
+encoders. BC5 additionally rejects a refinement if its worst reconstructed
+positive-Z normal angle increases relative to that range fit, using an integer
+score with twelve fractional coordinate bits. XY outside the unit disk uses
+Z = 0 and normalized vectors. This does not bound mean angular error or promise
+angular quality against every other encoder. Quality trades extra encoding work
+for lower squared error within the byte-error and normal-angle bounds. BC4 and BC5 support it at every
+preset; BC1, BC3 and BC7 ignore it.
+
+`Settings::new` keeps `Bc45Fit::SquaredError`, preserving existing preset output.
+`Settings` is `#[non_exhaustive]`: build it with `Settings::new` plus
+`with_alpha` and `with_bc45_fit`. `Format`, `Effort`, `AlphaPolicy`, `Bc45Fit`
+and `Error` are also `#[non_exhaustive]`, so matches on them need a wildcard arm.
+
 ## Claims
 
 On a sealed test set of 30 CC0 inputs from 13 assets, using single-thread
@@ -81,6 +114,16 @@ instruction cost and visible-texel quality metrics:
   0.86x its single-thread instruction cost.
 - BC5 Balanced uses 0.80x the single-thread instruction cost of rusty_dds,
   with +0.13 dB pooled PSNR.
+
+On other measured sets:
+
+- BC5 with `Bc45Fit::PeakBounded` encodes packed RG8 input in 1.66x Intel's
+  wall time (2.10x from RGBA8 input). It is slower than Intel; it adds the
+  per-block peak-error bound described above.
+- BC6H error (log-space RMSE) is equal to or lower than Intel ISPC's at Fast,
+  Balanced and Quality on the 24-image HDR set below; exposure PSNR is within
+  0.03 dB.
+  There is no BC6H speed claim: Intel is faster at every preset.
 
 BC1, BC3 and BC7, at all presets, are provided without performance claims.
 BC4 and BC5 Fast and Quality are provided without performance claims.
@@ -99,6 +142,43 @@ BC5 also had to pass the required R/G channel pools. An independent read-only
 check reproduced the results from raw receipts. These results apply to this
 test set and these metrics; they establish neither wall-time speed nor
 multi-thread performance or quality on every unseen texture.
+
+### Fuzzing
+
+`fuzz/` holds three libFuzzer targets (run with `cargo +nightly fuzz run
+<target>` from the repository root; seed corpora are in `fuzz/corpus/`):
+
+- `bc6h_encode`: arbitrary f32 and binary16 bit patterns (NaN, infinities,
+  subnormals, negative zero), RGB and RGBA, both signs, all presets, strided and
+  non-multiple-of-four sizes, through `encode_hdr` and `encode_hdr_into`, then
+  `decode_bc6h`. Checks the output length, equality of the two entry points, an
+  untouched output tail, and finite unsigned decodes.
+- `bc6h_decode`: arbitrary 16-byte blocks through `decode_bc6h`, both signs.
+- `bc5_peak`: BC4 and BC5 `PeakBounded` at every preset on strided R8, RG8 and
+  RGBA8 input. Checks determinism and that no block channel's peak byte error
+  exceeds the range fit's, with a separate round-to-nearest BC4 decoder.
+
+Method: cargo-fuzz 0.13.2, rustc 1.101.0-nightly (2026-10-04), AddressSanitizer,
+debug assertions and overflow checks on, x86_64 with runtime-dispatched
+SSE4.1/AVX2. Reach was measured first by replaying the seeds with LLVM
+coverage: `bc6h_encode` seeds reached 93% of `bc6h.rs` lines and 82% of
+`hdr.rs`. Each target then ran in 600 s segments on one core until a segment
+added no coverage, then once more with `-rss_limit_mb=512`.
+
+| Target | Segments (s) | Executions | Edges | Final reach | Crashes |
+| --- | ---: | ---: | ---: | --- | ---: |
+| `bc6h_encode` | 3 x 601 | 214,487 | 878 | `bc6h.rs` 93%, `hdr.rs` 88% of lines | 0 |
+| `bc6h_decode` | 3 x 601 | 105,134,469 | 235 | decoder paths (`bc6h.rs` 22%, `hdr.rs` 4% of lines) | 0 |
+| `bc5_peak` | 3 x 601 | 787,474 | 908 | `bc4.rs` 82% of lines | 0 |
+
+Every run exited 0 (including the 512 MB runs). The first `bc5_peak` run stopped
+on its own check: the target's reference decoder truncated BC4 interpolants,
+while the format rounds them. The fault was in the target, not the library; it
+was corrected and `bc5_peak` was rerun from its seeds, which is the row above.
+This establishes that about ten minutes of coverage-guided fuzzing per target
+found no panic, overflow, out-of-bounds access or violated check on x86_64. It
+does not cover NEON or WebAssembly code paths, other CPUs' dispatch choices,
+or images larger than 23x23 texels.
 
 ## Licence
 
@@ -202,7 +282,7 @@ These are unsigned results; the independent decoder check covers both signs.
 | Balanced / basic | 0.017771 / 0.017845 | 47.07 / 47.10 | 201.69 / 19.13 |
 | Quality / slow | 0.017517 / 0.017640 | 47.17 / 47.20 | 322.43 / 91.25 |
 
-The Intel log-RMSE quality target passes at all three presets.
-The encode-time target of at most twice Intel is not achieved at every preset.
+Our log RMSE is at or below Intel's at all three presets. Intel encodes faster
+at every preset, so there is no BC6H speed claim.
 These paired timings were collected on a shared host and retain scheduling noise. Full-size images, other HDR content, signed
 quality against Intel, and hardware GPU decoding are not qualified by this run.

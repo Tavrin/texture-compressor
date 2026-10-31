@@ -1457,3 +1457,22 @@ mod rank_u32_edge_tests {
         }
     }
 }
+
+#[cfg(all(feature = "simd", feature = "std", target_arch = "x86_64"))]
+pub(crate) use fast::simd::byte_lookup;
+
+// Shared byte reduction lives with the existing checked SIMD kernels.
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
+pub(crate) use fast::simd::byte_bounds;
+
+#[cfg(all(feature = "simd", feature = "std", target_arch = "x86_64"))]
+pub(crate) use fast::simd::byte_search;
+
+#[cfg(all(feature = "simd", feature = "std", target_arch = "x86_64"))]
+pub(crate) use fast::simd::range_channel;
+
+#[cfg(all(feature = "simd", feature = "std", target_arch = "x86_64"))]
+pub(crate) use fast::simd::range_encoder;
+
+#[cfg(all(feature = "simd", feature = "std", target_arch = "x86_64"))]
+pub(crate) use fast::simd::range_encoder_sse41;
