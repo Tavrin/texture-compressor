@@ -72,6 +72,38 @@ assert_eq!(blocks.len(), 16);
 # Ok::<(), texture_compressor::Error>(())
 ```
 
+### Bound BC4/BC5 peak byte error
+
+Set `settings.bc45_fit = Bc45Fit::PeakBounded` to opt in:
+
+```rust
+use texture_compressor::{encode, Bc45Fit, Effort, Format, ImageView, Settings};
+
+let xy = [128u8; 4 * 4 * 2];
+let mut settings = Settings::new(Format::Bc5, Effort::Balanced);
+settings.bc45_fit = Bc45Fit::PeakBounded;
+let blocks = encode(ImageView::rg8(&xy, 4, 4, 8)?, &settings)?;
+# Ok::<(), texture_compressor::Error>(())
+```
+
+For each channel and block, this starts with maximum/minimum endpoints and
+nearest palette selectors. Fast and Balanced keep these endpoints and need no
+search or normal-angle guard. Quality searches for lower squared error without
+increasing that fit's maximum absolute byte error, using the preset's fit and a
+fixed endpoint neighborhood. The bound refers to the
+unsigned integer BC4 reconstruction, including replicated edge texels.
+It is relative to this range fit, rather than a universal bound against other
+encoders. BC5 additionally rejects a refinement if its worst reconstructed
+positive-Z normal angle increases relative to that range fit, using an integer
+score with twelve fractional coordinate bits. XY outside the unit disk uses
+Z = 0 and normalized vectors. This does not bound mean angular error or promise
+angular quality against every other encoder. Quality trades extra encoding work
+for lower squared error within the byte-error and normal-angle bounds. BC4 and BC5 support it at every
+preset; BC1, BC3 and BC7 ignore it.
+
+`Settings::new` keeps `Bc45Fit::SquaredError`, preserving existing preset output.
+Code constructing `Settings` with a struct literal must also supply `bc45_fit`.
+
 ## Claims
 
 On a sealed test set of 30 CC0 inputs from 13 assets, using single-thread

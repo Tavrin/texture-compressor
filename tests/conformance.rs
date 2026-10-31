@@ -112,6 +112,7 @@ fn random_npot_and_determinism() {
                         format: f,
                         effort,
                         alpha,
+                        bc45_fit: texture_compressor::Bc45Fit::SquaredError,
                     };
                     let encode_full = || {
                         encode(
@@ -227,6 +228,7 @@ fn constant_and_transparent_roundtrip() {
         format: Format::Bc1,
         effort: Effort::Quality,
         alpha: AlphaPolicy::PunchThrough { threshold: 128 },
+        bc45_fit: texture_compressor::Bc45Fit::SquaredError,
     };
     let out = encode(ImageView::rgba8(&data, 4, 4, 16).unwrap(), &settings).unwrap();
     assert_eq!(bc1(&out), [[0, 0, 0, 0]; 16]);
@@ -271,6 +273,7 @@ fn parallel_matches_serial_across_shapes_and_pools() {
                         format,
                         effort,
                         alpha,
+                        bc45_fit: texture_compressor::Bc45Fit::SquaredError,
                     };
                     let expected = encode(image, &settings).unwrap();
                     for threads in [1, 2, 4, 32] {
@@ -411,6 +414,7 @@ fn solid_blocks_match_p3_sampled_bytes() {
                     format: Format::Bc1,
                     effort,
                     alpha,
+                    bc45_fit: texture_compressor::Bc45Fit::SquaredError,
                 };
                 let out = encode(ImageView::rgba8(&data, 4, 4, 16).unwrap(), &settings).unwrap();
                 assert_eq!(out, expected, "rgb={rgb:?} masked={masked}");
@@ -501,6 +505,7 @@ fn bc3_bc5_known_channel_blocks_and_policies() {
                 format,
                 effort,
                 alpha: AlphaPolicy::PunchThrough { threshold: 128 },
+                bc45_fit: texture_compressor::Bc45Fit::SquaredError,
             };
             assert_eq!(
                 encode(image, &settings),
@@ -610,6 +615,193 @@ fn bc7_npot_edges_repeat_and_opaque_alpha() {
                     }
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn peak_bounded_channels_respect_range_fit() {
+    use texture_compressor::Bc45Fit;
+    let mut state = 59u32;
+    for sample in 0..384u32 {
+        let mut rgba = [0u8; 64];
+        for p in rgba.as_chunks_mut::<4>().0 {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            let x = (state >> 24) as u8;
+            p[0] = match sample % 4 {
+                0 => x,
+                1 => 120 + x % 16,
+                2 => {
+                    if x < 128 {
+                        0
+                    } else {
+                        255
+                    }
+                }
+                _ => sample as u8,
+            };
+            p[1] = x.wrapping_mul(37);
+        }
+        for effort in [Effort::Fast, Effort::Balanced, Effort::Quality] {
+            let mut settings = Settings::new(Format::Bc5, effort);
+            settings.bc45_fit = Bc45Fit::PeakBounded;
+            let image = ImageView::rgba8(&rgba, 4, 4, 16).unwrap();
+            let blocks = encode(image, &settings).unwrap();
+            assert_eq!(blocks, encode(image, &settings).unwrap());
+            for c in 0..2 {
+                let values: Vec<_> = rgba.as_chunks::<4>().0.iter().map(|p| p[c]).collect();
+                let lo = *values.iter().min().unwrap();
+                let hi = *values.iter().max().unwrap();
+                // Independent decoder enumerates the range palette by selecting
+                // every entry, then the nearest reconstruction is the oracle.
+                let bits = (0..16).fold(0u64, |b, i| b | ((i % 8) << (3 * i)));
+                let mut range = [hi, lo, 0, 0, 0, 0, 0, 0];
+                range[2..].copy_from_slice(&bits.to_le_bytes()[..6]);
+                let palette = bc4(&range);
+                let base: Vec<_> = values
+                    .iter()
+                    .map(|&v| palette.iter().map(|&p| v.abs_diff(p) as u32).min().unwrap())
+                    .collect();
+                let decoded = bc4(&blocks[c * 8..c * 8 + 8]);
+                let errors: Vec<_> = values
+                    .iter()
+                    .zip(decoded)
+                    .map(|(&a, b)| a.abs_diff(b) as u32)
+                    .collect();
+                assert!(errors.iter().max() <= base.iter().max());
+                assert!(
+                    errors.iter().map(|d| d * d).sum::<u32>()
+                        <= base.iter().map(|d| d * d).sum::<u32>()
+                );
+                let mut scalar = settings;
+                scalar.format = Format::Bc4;
+                let packed: Vec<_> = values;
+                let channel = encode(ImageView::r8(&packed, 4, 4, 4).unwrap(), &scalar).unwrap();
+                let scalar_errors: Vec<_> = packed
+                    .iter()
+                    .zip(bc4(&channel))
+                    .map(|(&a, b)| a.abs_diff(b) as u32)
+                    .collect();
+                assert!(scalar_errors.iter().max() <= base.iter().max());
+                assert!(
+                    scalar_errors.iter().map(|d| d * d).sum::<u32>()
+                        <= base.iter().map(|d| d * d).sum::<u32>()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn peak_fit_npot_strides_and_unrelated_formats() {
+    use texture_compressor::{encode_into, encoded_len, Bc45Fit};
+    let mut data = [0u8; 7 * 60];
+    for (i, x) in data.iter_mut().enumerate() {
+        *x = (i * 47) as u8;
+    }
+    let image = ImageView::rgba8(&data, 13, 7, 60).unwrap();
+    for format in [
+        Format::Bc1,
+        Format::Bc3,
+        Format::Bc4,
+        Format::Bc5,
+        Format::Bc7,
+    ] {
+        for effort in [Effort::Fast, Effort::Balanced, Effort::Quality] {
+            let mut settings = Settings::new(format, effort);
+            let default = encode(image, &settings).unwrap();
+            settings.bc45_fit = Bc45Fit::PeakBounded;
+            let expected = encode(image, &settings).unwrap();
+            if !matches!(format, Format::Bc4 | Format::Bc5) {
+                assert_eq!(expected, default);
+            }
+            let len = encoded_len(format, 13, 7).unwrap();
+            let mut out = vec![0xa5; len + 9];
+            encode_into(image, &settings, &mut out).unwrap();
+            assert_eq!(&out[..len], &expected);
+            assert_eq!(&out[len..], &[0xa5; 9]);
+            #[cfg(feature = "parallel")]
+            {
+                texture_compressor::encode_into_parallel(image, &settings, &mut out).unwrap();
+                assert_eq!(&out[..len], &expected);
+                assert_eq!(&out[len..], &[0xa5; 9]);
+            }
+        }
+    }
+}
+
+#[test]
+fn peak_bounded_normal_guard_matches_float_oracle() {
+    use texture_compressor::Bc45Fit;
+    fn normal(xy: [u8; 2]) -> [f64; 3] {
+        let x = f64::from(xy[0]) * (2.0 / 255.0) - 1.0;
+        let y = f64::from(xy[1]) * (2.0 / 255.0) - 1.0;
+        let z = (1.0 - x * x - y * y).max(0.0).sqrt();
+        let len = (x * x + y * y + z * z).sqrt();
+        [x / len, y / len, z / len]
+    }
+    fn angle(a: [u8; 2], b: [u8; 2]) -> f64 {
+        let a = normal(a);
+        let b = normal(b);
+        (a[0] * b[0] + a[1] * b[1] + a[2] * b[2])
+            .clamp(-1.0, 1.0)
+            .acos()
+            .to_degrees()
+    }
+    let mut state = 1937u32;
+    for _ in 0..128 {
+        let mut rgba = [0; 64];
+        for x in &mut rgba {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            *x = (state >> 24) as u8;
+        }
+        let mut range = [[0u8; 2]; 16];
+        for c in 0..2 {
+            let values: Vec<_> = rgba.as_chunks::<4>().0.iter().map(|p| p[c]).collect();
+            let mut block = [
+                *values.iter().max().unwrap(),
+                *values.iter().min().unwrap(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ];
+            let bits = (0..16).fold(0u64, |b, i| b | ((i % 8) << (3 * i)));
+            block[2..].copy_from_slice(&bits.to_le_bytes()[..6]);
+            let palette = bc4(&block);
+            for (i, &x) in values.iter().enumerate() {
+                let (_, j) = palette[..8]
+                    .iter()
+                    .enumerate()
+                    .map(|(j, &p)| (x.abs_diff(p), j))
+                    .min()
+                    .unwrap();
+                range[i][c] = palette[j];
+            }
+        }
+        let base = rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(range)
+            .map(|(s, b)| angle([s[0], s[1]], b))
+            .fold(0.0, f64::max);
+        for effort in [Effort::Fast, Effort::Balanced, Effort::Quality] {
+            let mut settings = Settings::new(Format::Bc5, effort);
+            settings.bc45_fit = Bc45Fit::PeakBounded;
+            let block = encode(ImageView::rgba8(&rgba, 4, 4, 16).unwrap(), &settings).unwrap();
+            let r = bc4(&block[..8]);
+            let g = bc4(&block[8..]);
+            let peak = rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .enumerate()
+                .map(|(i, s)| angle([s[0], s[1]], [r[i], g[i]]))
+                .fold(0.0, f64::max);
+            assert!(peak <= base + 0.001, "{effort:?}: {peak} > {base}");
         }
     }
 }

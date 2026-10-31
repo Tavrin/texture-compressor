@@ -337,3 +337,261 @@ mod tests {
     const C1: usize = 4;
     const CH: usize = 3;
 }
+
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[inline]
+pub(crate) fn byte_lookup(values: &[u8; 16], min: u8, table: &[u8; 8]) -> Option<[u8; 16]> {
+    if !std::arch::is_x86_feature_detected!("ssse3") {
+        return None;
+    }
+    // SAFETY: this exact feature was checked; all extents are fixed arrays.
+    Some(unsafe { byte_lookup_ssse3(values, min, table) })
+}
+
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[target_feature(enable = "ssse3")]
+fn byte_lookup_ssse3(values: &[u8; 16], min: u8, table: &[u8; 8]) -> [u8; 16] {
+    use core::arch::x86_64::*;
+    let mut out = [0; 16];
+    // SAFETY: the loads read exactly sixteen and eight bytes respectively,
+    // and the store writes exactly sixteen bytes to its fixed output array.
+    unsafe {
+        let v = _mm_loadu_si128(values.as_ptr().cast());
+        let t = _mm_loadl_epi64(table.as_ptr().cast());
+        let offsets = _mm_sub_epi8(v, _mm_set1_epi8(i8::from_ne_bytes([min])));
+        _mm_storeu_si128(out.as_mut_ptr().cast(), _mm_shuffle_epi8(t, offsets));
+    }
+    out
+}
+
+/// Exact unsigned byte bounds for range fitting in other block formats.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub(crate) fn byte_bounds(values: &[u8; 16]) -> (u8, u8) {
+    use core::arch::x86_64::*;
+    // SAFETY: SSE2 is part of the x86_64 baseline. The fixed array provides
+    // sixteen readable bytes; loadu imposes no additional alignment requirement.
+    // All remaining operations are register-only, and only the low byte is read.
+    unsafe {
+        let v = _mm_loadu_si128(values.as_ptr().cast());
+        let mut lo = _mm_min_epu8(v, _mm_srli_si128::<8>(v));
+        let mut hi = _mm_max_epu8(v, _mm_srli_si128::<8>(v));
+        lo = _mm_min_epu8(lo, _mm_srli_si128::<4>(lo));
+        hi = _mm_max_epu8(hi, _mm_srli_si128::<4>(hi));
+        lo = _mm_min_epu8(lo, _mm_srli_si128::<2>(lo));
+        hi = _mm_max_epu8(hi, _mm_srli_si128::<2>(hi));
+        lo = _mm_min_epu8(lo, _mm_srli_si128::<1>(lo));
+        hi = _mm_max_epu8(hi, _mm_srli_si128::<1>(hi));
+        (
+            _mm_cvtsi128_si32(lo).to_le_bytes()[0],
+            _mm_cvtsi128_si32(hi).to_le_bytes()[0],
+        )
+    }
+}
+
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[inline]
+pub(crate) fn byte_search(values: &[u8; 16], bounds: &[u8; 7]) -> Option<[u8; 16]> {
+    if !std::arch::is_x86_feature_detected!("ssse3") {
+        return None;
+    }
+    // SAFETY: SSSE3 was explicitly checked, and extents are fixed arrays.
+    Some(unsafe { byte_search_ssse3(values, bounds) })
+}
+
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[target_feature(enable = "ssse3")]
+fn byte_search_ssse3(values: &[u8; 16], bounds: &[u8; 7]) -> [u8; 16] {
+    use core::arch::x86_64::*;
+    let limits = [
+        bounds[0], bounds[1], bounds[2], bounds[3], bounds[4], bounds[5], bounds[6], 0,
+    ];
+    let mut out = [0; 16];
+    // SAFETY: fixed arrays provide the exact 16/8-byte input loads and the
+    // 16-byte output store. PSHUFB only indexes registers. Wide-range bounds
+    // are nonzero, so comparing x > bound-1 implements x >= bound exactly.
+    unsafe {
+        let sign = _mm_set1_epi8(i8::MIN);
+        let one = _mm_set1_epi8(1);
+        let x = _mm_xor_si128(_mm_loadu_si128(values.as_ptr().cast()), sign);
+        let b = _mm_xor_si128(
+            _mm_sub_epi8(_mm_loadl_epi64(limits.as_ptr().cast()), one),
+            sign,
+        );
+        let c = _mm_cmpgt_epi8(x, _mm_shuffle_epi8(b, _mm_set1_epi8(3)));
+        let mut lo = _mm_and_si128(c, _mm_set1_epi8(4));
+        let c = _mm_cmpgt_epi8(x, _mm_shuffle_epi8(b, _mm_add_epi8(lo, one)));
+        lo = _mm_add_epi8(lo, _mm_and_si128(c, _mm_set1_epi8(2)));
+        let c = _mm_cmpgt_epi8(x, _mm_shuffle_epi8(b, lo));
+        lo = _mm_add_epi8(lo, _mm_and_si128(c, one));
+        let selectors = _mm_setr_epi8(1, 7, 6, 5, 4, 3, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        _mm_storeu_si128(out.as_mut_ptr().cast(), _mm_shuffle_epi8(selectors, lo));
+    }
+    out
+}
+
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[inline]
+pub(crate) fn range_channel(values: &[u8; 16]) -> Option<[u8; 8]> {
+    if !std::arch::is_x86_feature_detected!("ssse3") {
+        return None;
+    }
+    // SAFETY: SSSE3 was checked, and the reference has exactly sixteen bytes.
+    Some(unsafe { range_channel_ssse3(values) })
+}
+
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[target_feature(enable = "ssse3")]
+fn range_channel_ssse3(values: &[u8; 16]) -> [u8; 8] {
+    use core::arch::x86_64::*;
+    let (min, max) = byte_bounds(values);
+    let span = usize::from(max - min);
+    // SAFETY: fixed-array extents permit the 16-byte source load, eight-byte
+    // table loads and sixteen-byte packed-word store. All lookup is in registers.
+    unsafe {
+        let v = _mm_loadu_si128(values.as_ptr().cast());
+        let minimum = _mm_set1_epi8(i8::from_ne_bytes([min]));
+        let selectors = if span <= 7 {
+            let table = &crate::bc4::NARROW_SELECTORS[span];
+            _mm_shuffle_epi8(
+                _mm_loadl_epi64(table.as_ptr().cast()),
+                _mm_sub_epi8(v, minimum),
+            )
+        } else {
+            let t = &crate::bc4::RANGE_BOUND_OFFSETS[span];
+            let offsets = [t[0], t[1], t[2], t[3], t[4], t[5], t[6], 0];
+            let one = _mm_set1_epi8(1);
+            let sign = _mm_set1_epi8(i8::MIN);
+            let x = _mm_xor_si128(v, sign);
+            let limits = _mm_add_epi8(_mm_loadl_epi64(offsets.as_ptr().cast()), minimum);
+            let b = _mm_xor_si128(_mm_sub_epi8(limits, one), sign);
+            let c = _mm_cmpgt_epi8(x, _mm_shuffle_epi8(b, _mm_set1_epi8(3)));
+            let mut pos = _mm_and_si128(c, _mm_set1_epi8(4));
+            let c = _mm_cmpgt_epi8(x, _mm_shuffle_epi8(b, _mm_add_epi8(pos, one)));
+            pos = _mm_add_epi8(pos, _mm_and_si128(c, _mm_set1_epi8(2)));
+            let c = _mm_cmpgt_epi8(x, _mm_shuffle_epi8(b, pos));
+            pos = _mm_add_epi8(pos, _mm_and_si128(c, one));
+            let map = _mm_setr_epi8(1, 7, 6, 5, 4, 3, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+            _mm_shuffle_epi8(map, pos)
+        };
+        let mut packed = _mm_or_si128(selectors, _mm_srli_epi64::<5>(selectors));
+        packed = _mm_and_si128(packed, _mm_set1_epi64x(0x003f_003f_003f_003f));
+        packed = _mm_or_si128(packed, _mm_srli_epi64::<10>(packed));
+        packed = _mm_and_si128(packed, _mm_set1_epi64x(0x0000_0fff_0000_0fff));
+        packed = _mm_or_si128(packed, _mm_srli_epi64::<20>(packed));
+        packed = _mm_and_si128(packed, _mm_set1_epi64x(0x00ff_ffff));
+        let mut words = [0u64; 2];
+        _mm_storeu_si128(words.as_mut_ptr().cast(), packed);
+        let bits = (words[0] | (words[1] << 24)).to_le_bytes();
+        [
+            max, min, bits[0], bits[1], bits[2], bits[3], bits[4], bits[5],
+        ]
+    }
+}
+
+// A checked capability lets block rows share one immutable ISA decision.
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+pub(crate) struct RangeEncoder {
+    _private: (),
+}
+
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+pub(crate) fn range_encoder() -> Option<RangeEncoder> {
+    if !std::arch::is_x86_feature_detected!("ssse3") {
+        return None;
+    }
+    Some(RangeEncoder { _private: () })
+}
+
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+impl RangeEncoder {
+    #[inline]
+    pub(crate) fn encode(&self, values: &[u8; 16]) -> [u8; 8] {
+        // SAFETY: only range_encoder can construct this private capability,
+        // after checking SSSE3. CPU features remain valid for its lifetime.
+        unsafe { range_channel_ssse3(values) }
+    }
+}
+
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[target_feature(enable = "ssse3,sse4.1")]
+fn range_channel_sse41(values: &[u8; 16]) -> [u8; 8] {
+    use core::arch::x86_64::*;
+    // SAFETY: the source is a fixed sixteen-byte array and both target
+    // features were established by the checked capability below.
+    let (min, max) = unsafe {
+        let v = _mm_loadu_si128(values.as_ptr().cast());
+        let upper = _mm_srli_si128::<8>(v);
+        let lo = _mm_cvtepu8_epi16(_mm_min_epu8(v, upper));
+        let hi = _mm_cvtepu8_epi16(_mm_xor_si128(_mm_max_epu8(v, upper), _mm_set1_epi8(-1)));
+        let min = _mm_cvtsi128_si32(_mm_minpos_epu16(lo)).to_le_bytes()[0];
+        let inverse_max = _mm_cvtsi128_si32(_mm_minpos_epu16(hi)).to_le_bytes()[0];
+        (min, 255 - inverse_max)
+    };
+    let span = usize::from(max - min);
+    // SAFETY: fixed-array extents permit the 16-byte source load, eight-byte
+    // table loads and sixteen-byte packed-word store. All lookup is in registers.
+    unsafe {
+        let v = _mm_loadu_si128(values.as_ptr().cast());
+        let minimum = _mm_set1_epi8(i8::from_ne_bytes([min]));
+        let selectors = if span <= 7 {
+            let table = &crate::bc4::NARROW_SELECTORS[span];
+            _mm_shuffle_epi8(
+                _mm_loadl_epi64(table.as_ptr().cast()),
+                _mm_sub_epi8(v, minimum),
+            )
+        } else {
+            let t = &crate::bc4::RANGE_BOUND_OFFSETS[span];
+            let offsets = [t[0], t[1], t[2], t[3], t[4], t[5], t[6], 0];
+            let one = _mm_set1_epi8(1);
+            let sign = _mm_set1_epi8(i8::MIN);
+            let x = _mm_xor_si128(v, sign);
+            let limits = _mm_add_epi8(_mm_loadl_epi64(offsets.as_ptr().cast()), minimum);
+            let b = _mm_xor_si128(_mm_sub_epi8(limits, one), sign);
+            let c = _mm_cmpgt_epi8(x, _mm_shuffle_epi8(b, _mm_set1_epi8(3)));
+            let mut pos = _mm_and_si128(c, _mm_set1_epi8(4));
+            let c = _mm_cmpgt_epi8(x, _mm_shuffle_epi8(b, _mm_add_epi8(pos, one)));
+            pos = _mm_add_epi8(pos, _mm_and_si128(c, _mm_set1_epi8(2)));
+            let c = _mm_cmpgt_epi8(x, _mm_shuffle_epi8(b, pos));
+            pos = _mm_add_epi8(pos, _mm_and_si128(c, one));
+            let map = _mm_setr_epi8(1, 7, 6, 5, 4, 3, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+            _mm_shuffle_epi8(map, pos)
+        };
+        let mut packed = _mm_or_si128(selectors, _mm_srli_epi64::<5>(selectors));
+        packed = _mm_and_si128(packed, _mm_set1_epi64x(0x003f_003f_003f_003f));
+        packed = _mm_or_si128(packed, _mm_srli_epi64::<10>(packed));
+        packed = _mm_and_si128(packed, _mm_set1_epi64x(0x0000_0fff_0000_0fff));
+        packed = _mm_or_si128(packed, _mm_srli_epi64::<20>(packed));
+        packed = _mm_and_si128(packed, _mm_set1_epi64x(0x00ff_ffff));
+        let mut words = [0u64; 2];
+        _mm_storeu_si128(words.as_mut_ptr().cast(), packed);
+        let bits = (words[0] | (words[1] << 24)).to_le_bytes();
+        [
+            max, min, bits[0], bits[1], bits[2], bits[3], bits[4], bits[5],
+        ]
+    }
+}
+
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+pub(crate) struct Sse41RangeEncoder {
+    _private: (),
+}
+
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+pub(crate) fn range_encoder_sse41() -> Option<Sse41RangeEncoder> {
+    if !std::arch::is_x86_feature_detected!("ssse3")
+        || !std::arch::is_x86_feature_detected!("sse4.1")
+    {
+        return None;
+    }
+    Some(Sse41RangeEncoder { _private: () })
+}
+
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+impl Sse41RangeEncoder {
+    #[inline]
+    pub(crate) fn encode(&self, values: &[u8; 16]) -> [u8; 8] {
+        // SAFETY: private construction establishes both SSSE3 and SSE4.1.
+        unsafe { range_channel_sse41(values) }
+    }
+}
