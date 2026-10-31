@@ -12,6 +12,7 @@ use rayon::prelude::*;
 
 /// GPU block-compression format. BC4 and BC5 encode unsigned channels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Format {
     /// RGB with optional one-bit alpha, eight bytes per 4x4 block.
     Bc1,
@@ -23,9 +24,14 @@ pub enum Format {
     Bc5,
     /// RGBA, sixteen bytes per 4x4 block.
     Bc7,
+    /// Unsigned RGB half-float HDR, sixteen bytes per 4x4 block.
+    Bc6hUf16,
+    /// Signed RGB half-float HDR, sixteen bytes per 4x4 block.
+    Bc6hSf16,
 }
 /// Encoder search preset.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Effort {
     /// Limited search. BC7 fits each subset along its principal axis, refines
     /// endpoints by least squares, and searches further only where a block's
@@ -39,6 +45,7 @@ pub enum Effort {
 }
 /// Alpha handling; punch-through is supported only for BC1.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AlphaPolicy {
     /// Opaque BC1 blocks. BC3 and BC7 preserve input alpha with this policy.
     Opaque,
@@ -50,6 +57,7 @@ pub enum AlphaPolicy {
 }
 /// Endpoint objective for unsigned BC4 and BC5 channels.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Bc45Fit {
     /// The existing preset's squared-error fit (the default).
     #[default]
@@ -66,7 +74,12 @@ pub enum Bc45Fit {
     PeakBounded,
 }
 /// Format, search preset and fitting policies used by an encode operation.
+///
+/// Build with [`Settings::new`] and the `with_*` methods; the struct is
+/// `#[non_exhaustive]`, so it cannot be built with a struct literal outside
+/// this crate and may gain fields in later releases.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct Settings {
     /// Output block format.
     pub format: Format,
@@ -87,9 +100,20 @@ impl Settings {
             bc45_fit: Bc45Fit::SquaredError,
         }
     }
+    /// Return these settings with the given alpha policy.
+    pub fn with_alpha(mut self, alpha: AlphaPolicy) -> Self {
+        self.alpha = alpha;
+        self
+    }
+    /// Return these settings with the given BC4/BC5 endpoint objective.
+    pub fn with_bc45_fit(mut self, bc45_fit: Bc45Fit) -> Self {
+        self.bc45_fit = bc45_fit;
+        self
+    }
 }
 /// Image validation or encoding failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// Width or height is zero.
     EmptyImage,
@@ -216,7 +240,7 @@ pub fn encoded_len(format: Format, width: u32, height: u32) -> Result<usize, Err
 fn block_size(format: Format) -> usize {
     match format {
         Format::Bc1 | Format::Bc4 => 8,
-        Format::Bc3 | Format::Bc5 | Format::Bc7 => 16,
+        Format::Bc3 | Format::Bc5 | Format::Bc7 | Format::Bc6hUf16 | Format::Bc6hSf16 => 16,
     }
 }
 
@@ -293,7 +317,9 @@ fn validate(
     settings: &Settings,
     output_len: usize,
 ) -> Result<(usize, usize), Error> {
-    if (matches!(settings.format, Format::Bc1 | Format::Bc3 | Format::Bc7) && image.channels != 4)
+    if matches!(settings.format, Format::Bc6hUf16 | Format::Bc6hSf16)
+        || (matches!(settings.format, Format::Bc1 | Format::Bc3 | Format::Bc7)
+            && image.channels != 4)
         || (settings.format == Format::Bc5 && !matches!(image.channels, 2 | 4))
         || (settings.format != Format::Bc1 && !matches!(settings.alpha, AlphaPolicy::Opaque))
     {
@@ -382,6 +408,7 @@ fn encode_row(image: ImageView<'_>, settings: &Settings, by: usize, row: &mut [u
                 settings.bc45_fit,
             )),
             Format::Bc7 => dst.copy_from_slice(&bc7::encode(&pixels, settings.effort)),
+            Format::Bc6hUf16 | Format::Bc6hSf16 => unreachable!("validated byte input"),
         }
     }
 }
@@ -390,6 +417,10 @@ mod bc1;
 mod bc4;
 mod bc7;
 mod budget;
+
+mod bc6h;
+mod hdr;
+pub use hdr::{decode_bc6h, encode_hdr, encode_hdr_into, HdrImageView};
 
 // Stage only the two fitted channels, and keep their output widths static.
 // The generic row encoder remains the path for defaults and Quality.

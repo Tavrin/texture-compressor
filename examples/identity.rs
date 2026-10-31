@@ -14,12 +14,7 @@ fn main() {
         Format::Bc7,
     ] {
         for effort in [Effort::Fast, Effort::Balanced, Effort::Quality] {
-            let settings = Settings {
-                format,
-                effort,
-                alpha: AlphaPolicy::Opaque,
-                bc45_fit: texture_compressor::Bc45Fit::SquaredError,
-            };
+            let settings = Settings::new(format, effort).with_alpha(AlphaPolicy::Opaque);
             let data = encode(ImageView::rgba8(&pixels, 13, 7, 52).unwrap(), &settings).unwrap();
             for b in data {
                 print!("{b:02x}");
@@ -74,12 +69,7 @@ fn main() {
             AlphaPolicy::Opaque,
             AlphaPolicy::PunchThrough { threshold: 128 },
         ] {
-            let settings = Settings {
-                format: Format::Bc1,
-                effort,
-                alpha,
-                bc45_fit: texture_compressor::Bc45Fit::SquaredError,
-            };
+            let settings = Settings::new(Format::Bc1, effort).with_alpha(alpha);
             let data = encode(ImageView::rgba8(&block, 4, 4, 16).unwrap(), &settings).unwrap();
             for byte in data {
                 print!("{byte:02x}");

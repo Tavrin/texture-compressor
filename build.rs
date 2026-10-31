@@ -4,6 +4,32 @@ use std::{env, fs::File, io::Write, path::PathBuf};
 // choose the same (squared error, endpoint 0, endpoint 1) minimum as the
 // original solid search. Relations are x < y, x == y, and x > y.
 fn main() {
+    // intel_tex_2's bundled Linux archive references the C++ unwind runtime.
+    // Keep this qualification-only linkage confined to example binaries.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+        println!("cargo:rustc-link-arg-examples=-lstdc++");
+    }
+    // Exact decoded-half objective values, generated with the same software
+    // logarithm as the source objective. Both targets embed identical bits.
+    let mut hdr =
+        File::create(PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("hdr_log.rs")).unwrap();
+    writeln!(hdr, "static HALF_LOG: [f64; 31744] = [").unwrap();
+    for h in 0..31744u32 {
+        let e = h >> 10;
+        let m = h & 1023;
+        let x = if e == 0 {
+            m as f32 / 16777216.0
+        } else {
+            f32::from_bits(((e + 112) << 23) | (m << 13))
+        };
+        writeln!(
+            hdr,
+            "f64::from_bits({}),",
+            libm::log2(1.0 + 16.0 * f64::from(x)).to_bits()
+        )
+        .unwrap();
+    }
+    writeln!(hdr, "]; ").unwrap();
     println!("cargo:rerun-if-changed=build.rs");
     let mut out =
         File::create(PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("solid.rs")).unwrap();

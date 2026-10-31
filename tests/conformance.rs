@@ -108,12 +108,7 @@ fn random_npot_and_determinism() {
                     if f == Format::Bc4 && alpha != AlphaPolicy::Opaque {
                         continue;
                     }
-                    let settings = Settings {
-                        format: f,
-                        effort,
-                        alpha,
-                        bc45_fit: texture_compressor::Bc45Fit::SquaredError,
-                    };
+                    let settings = Settings::new(f, effort).with_alpha(alpha);
                     let encode_full = || {
                         encode(
                             ImageView::rgba8(&data, w as u32, h as u32, w * 4).unwrap(),
@@ -224,12 +219,8 @@ fn constant_and_transparent_roundtrip() {
     .unwrap();
     assert_eq!(bc1(&encoded), [[255, 0, 0, 255]; 16]);
     let data = [0u8; 64];
-    let settings = Settings {
-        format: Format::Bc1,
-        effort: Effort::Quality,
-        alpha: AlphaPolicy::PunchThrough { threshold: 128 },
-        bc45_fit: texture_compressor::Bc45Fit::SquaredError,
-    };
+    let settings = Settings::new(Format::Bc1, Effort::Quality)
+        .with_alpha(AlphaPolicy::PunchThrough { threshold: 128 });
     let out = encode(ImageView::rgba8(&data, 4, 4, 16).unwrap(), &settings).unwrap();
     assert_eq!(bc1(&out), [[0, 0, 0, 0]; 16]);
 }
@@ -269,12 +260,7 @@ fn parallel_matches_serial_across_shapes_and_pools() {
                     if format != Format::Bc1 && alpha != AlphaPolicy::Opaque {
                         continue;
                     }
-                    let settings = Settings {
-                        format,
-                        effort,
-                        alpha,
-                        bc45_fit: texture_compressor::Bc45Fit::SquaredError,
-                    };
+                    let settings = Settings::new(format, effort).with_alpha(alpha);
                     let expected = encode(image, &settings).unwrap();
                     for threads in [1, 2, 4, 32] {
                         let pool = rayon::ThreadPoolBuilder::new()
@@ -410,12 +396,7 @@ fn solid_blocks_match_p3_sampled_bytes() {
                 } else {
                     AlphaPolicy::Opaque
                 };
-                let settings = Settings {
-                    format: Format::Bc1,
-                    effort,
-                    alpha,
-                    bc45_fit: texture_compressor::Bc45Fit::SquaredError,
-                };
+                let settings = Settings::new(Format::Bc1, effort).with_alpha(alpha);
                 let out = encode(ImageView::rgba8(&data, 4, 4, 16).unwrap(), &settings).unwrap();
                 assert_eq!(out, expected, "rgb={rgb:?} masked={masked}");
             }
@@ -501,12 +482,8 @@ fn bc3_bc5_known_channel_blocks_and_policies() {
         assert_eq!(bc4(&b5[..8]), [255; 16]);
         assert_eq!(bc4(&b5[8..]), [0; 16]);
         for format in [Format::Bc3, Format::Bc5] {
-            let settings = Settings {
-                format,
-                effort,
-                alpha: AlphaPolicy::PunchThrough { threshold: 128 },
-                bc45_fit: texture_compressor::Bc45Fit::SquaredError,
-            };
+            let settings = Settings::new(format, effort)
+                .with_alpha(AlphaPolicy::PunchThrough { threshold: 128 });
             assert_eq!(
                 encode(image, &settings),
                 Err(texture_compressor::Error::UnsupportedPolicy)

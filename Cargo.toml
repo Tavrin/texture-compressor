@@ -1,15 +1,15 @@
 [package]
 name = "texture-compressor"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "Deterministic BC1, BC3, BC4, BC5 and BC7 texture encoding for native and WebAssembly"
+description = "Deterministic BC1, BC3, BC4, BC5, BC6H and BC7 texture encoding for native and WebAssembly"
 repository = "https://github.com/Tavrin/texture-compressor"
 readme = "README.md"
 keywords = ["texture", "compression", "bc7", "no-std", "wasm"]
 categories = ["encoding", "graphics"]
 rust-version = "1.98"
-include = ["src/**", "tests/**", "examples/**", "build.rs", "README.md", "CHANGELOG.md", "LICENSE-MIT", "LICENSE-APACHE"]
+include = ["src/**", "tests/**", "examples/**", "tools/**", "build.rs", "README.md", "CHANGELOG.md", "LICENSE-MIT", "LICENSE-APACHE"]
 
 [lib]
 path = "src/lib.rs"
@@ -24,3 +24,22 @@ parallel = ["std", "dep:rayon"]
 
 [dependencies]
 rayon = { version = "1.11", optional = true }
+
+libm = "0.2"
+
+[build-dependencies]
+libm = "0.2"
+
+[dev-dependencies]
+bcdec_rs = "0.2"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+intel_tex_2 = "0.5"
+
+[[example]]
+name = "bc6h_identity"
+required-features = ["std"]
+
+[[example]]
+name = "bc6h_measure"
+required-features = ["std"]

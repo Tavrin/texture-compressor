@@ -71,6 +71,12 @@ only after an independent runtime SSE4.1 check. Weighted palettes, seeds,
 polish and estimates retain their selected backend. No new unsafe block
 or unchecked memory operation is added.
 
+HDR pair distances use f64 vectors across eight independent blocks (two per
+SSE4.1 vector, four per AVX2 vector). Runtime dispatch establishes the ISA.
+Each unaligned load covers a fixed array at offsets whose width fits eight;
+stores target equally sized local arrays. RGB operations preserve scalar order
+without fused multiply-add or horizontal reduction. Other targets use scalar.
+
 `byte_lookup` checks SSSE3 explicitly before its target-feature kernel. Fixed
 arrays permit exactly 16/8-byte input loads and a 16-byte output store. Range
 fitting supplies offsets 0..7; PSHUFB itself never performs indexed memory reads.

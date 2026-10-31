@@ -72,3 +72,32 @@ fn to_float(a: __m256i) -> __m256 {
     _mm256_cvtepi32_ps(a)
 }
 kernels!("avx2", 8);
+
+// Each vector spans independent HDR blocks. No horizontal reductions or FMA:
+// the RGB accumulation order is exactly the scalar f64 order.
+#[target_feature(enable = "avx2")]
+pub(super) fn hdr_distances(src: &[[[f64; 8]; 16]; 3]) -> [[[f64; 16]; 16]; 8] {
+    let mut out = [[[0.0; 16]; 16]; 8];
+    for a in 0..16 {
+        for b in a..16 {
+            for base in (0..8).step_by(4) {
+                let mut d = _mm256_setzero_pd();
+                for channel in src {
+                    // base+4 <= 8, and unaligned loads are permitted.
+                    let x = unsafe { _mm256_loadu_pd(channel[a][base..].as_ptr()) };
+                    let y = unsafe { _mm256_loadu_pd(channel[b][base..].as_ptr()) };
+                    let v = _mm256_sub_pd(x, y);
+                    d = _mm256_add_pd(d, _mm256_mul_pd(v, v));
+                }
+                let mut values = [0.0; 4];
+                unsafe {
+                    _mm256_storeu_pd(values.as_mut_ptr(), d);
+                }
+                for l in 0..4 {
+                    out[base + l][a][b] = values[l];
+                }
+            }
+        }
+    }
+    out
+}

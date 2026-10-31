@@ -4,7 +4,7 @@ use crate::Effort;
 #[path = "bc7_fast.rs"]
 mod fast;
 #[path = "bc7_tables.rs"]
-mod tables;
+pub(super) mod tables;
 #[cfg(test)]
 use tables::{ANCHOR2, ANCHOR3A, ANCHOR3B};
 use tables::{PART2, PART3};
@@ -1015,6 +1015,11 @@ pub(crate) fn batch_width() -> usize {
 #[cfg(feature = "simd")]
 pub(crate) fn encode_batch(blocks: &[[[u8; 4]; 16]; 8], out: &mut [u8], effort: Effort) {
     fast::encode_batch(blocks, out, effort);
+}
+
+#[cfg(feature = "simd")]
+pub(crate) fn hdr_distances(src: &[[[f64; 8]; 16]; 3]) -> [[[f64; 16]; 16]; 8] {
+    fast::simd::hdr_distances(src)
 }
 
 #[cfg(test)]
