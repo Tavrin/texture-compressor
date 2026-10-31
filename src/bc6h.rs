@@ -1,0 +1,569 @@
+// Independent implementation of Khronos Data Format 1.4 section 20.2.
+// DirectXTex's endpoint perturbation search informed the search strategy only:
+// https://github.com/microsoft/DirectXTex/blob/main/DirectXTex/BC6HBC7.cpp
+use crate::Effort;
+#[path = "bc6h_layout.rs"]
+mod layout;
+use crate::bc7::tables as partitions;
+const MODES: [u8; 14] = [0, 1, 2, 6, 10, 14, 18, 22, 26, 30, 3, 7, 11, 15];
+const PREC: [u32; 14] = [10, 7, 11, 11, 11, 9, 8, 8, 8, 6, 10, 11, 12, 16];
+const DELTA: [[u32; 3]; 14] = [
+    [5; 3],
+    [6; 3],
+    [5, 4, 4],
+    [4, 5, 4],
+    [4, 4, 5],
+    [5; 3],
+    [6, 5, 5],
+    [5, 6, 5],
+    [5, 5, 6],
+    [6; 3],
+    [10; 3],
+    [9; 3],
+    [8; 3],
+    [4; 3],
+];
+const W3: [i32; 8] = [0, 9, 18, 27, 37, 46, 55, 64];
+const W4: [i32; 16] = [0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64];
+fn sign(x: i32, bits: u32) -> i32 {
+    let bit = 1 << (bits - 1);
+    (x ^ bit) - bit
+}
+fn transformed(m: usize) -> bool {
+    m != 9 && m != 10
+}
+fn unquant(x: i32, bits: u32, signed: bool) -> i32 {
+    if signed {
+        if bits >= 16 {
+            return x;
+        }
+        let a = x.abs();
+        let q = if a == 0 {
+            0
+        } else if a >= (1 << (bits - 1)) - 1 {
+            32767
+        } else {
+            ((a << 15) + 16384) >> (bits - 1)
+        };
+        if x < 0 {
+            -q
+        } else {
+            q
+        }
+    } else if bits >= 15 {
+        x
+    } else if x == 0 {
+        0
+    } else if x == (1 << bits) - 1 {
+        65535
+    } else {
+        ((x << 15) + 16384) >> (bits - 1)
+    }
+}
+fn finish(x: i32, signed: bool) -> u16 {
+    let v = if signed {
+        ((x.abs() * 31) >> 5) | if x < 0 { 32768 } else { 0 }
+    } else {
+        (x * 31) >> 6
+    };
+    v as u16
+}
+pub(crate) fn half(x: u16) -> f32 {
+    let a = u32::from(x & 32767);
+    let exponent = a >> 10;
+    let mantissa = a & 1023;
+    let v = if exponent == 0 {
+        (mantissa as f32) * (1.0 / 16777216.0)
+    } else {
+        f32::from_bits(((exponent + 112) << 23) | (mantissa << 13))
+    };
+    let v = if exponent == 31 {
+        if mantissa == 0 {
+            f32::INFINITY
+        } else {
+            f32::NAN
+        }
+    } else {
+        v
+    };
+    if x & 32768 != 0 {
+        -v
+    } else {
+        v
+    }
+}
+fn pattern(m: usize, p: usize, i: usize) -> usize {
+    if m >= 10 {
+        0
+    } else {
+        ((partitions::PART2[p] >> (2 * i)) & 1) as usize
+    }
+}
+fn anchor(m: usize, p: usize, i: usize) -> bool {
+    i == 0 || (m < 10 && i == partitions::ANCHOR2[p])
+}
+fn weights(m: usize) -> &'static [i32] {
+    if m < 10 {
+        &W3
+    } else {
+        &W4
+    }
+}
+fn palette(ep: &[[i32; 3]; 4], m: usize, signed: bool) -> [[[u16; 3]; 16]; 2] {
+    let mut out = [[[0; 3]; 16]; 2];
+    for s in 0..if m < 10 { 2 } else { 1 } {
+        for (i, &w) in weights(m).iter().enumerate() {
+            for c in 0..3 {
+                out[s][i][c] = finish(
+                    (ep[2 * s][c] * (64 - w) + ep[2 * s + 1][c] * w + 32) >> 6,
+                    signed,
+                );
+            }
+        }
+    }
+    out
+}
+pub(crate) fn decode(block: &[u8; 16], signed: bool) -> [[u16; 3]; 16] {
+    let bits = u128::from_le_bytes(*block);
+    let tag = if bits & 3 < 2 { bits & 3 } else { bits & 31 };
+    let Some(m) = MODES.iter().position(|&x| u128::from(x) == tag) else {
+        return [[0; 3]; 16];
+    };
+    let mut raw = [0i32; 12];
+    for (pos, &(e, b)) in layout::LAYOUT[m].iter().enumerate() {
+        if e != 255 && bits & (1u128 << pos) != 0 {
+            raw[usize::from(e)] |= 1 << b;
+        }
+    }
+    let mut ep = [[0; 3]; 4];
+    for e in 0..if m < 10 { 4 } else { 2 } {
+        for c in 0..3 {
+            let mut v = raw[e * 3 + c];
+            if e == 0 {
+                if signed {
+                    v = sign(v, PREC[m]);
+                }
+            } else {
+                if signed || transformed(m) {
+                    v = sign(v, DELTA[m][c]);
+                }
+                if transformed(m) {
+                    v = (v + ep[0][c]) & ((1 << PREC[m]) - 1);
+                    if signed {
+                        v = sign(v, PREC[m]);
+                    }
+                }
+            }
+            ep[e][c] = v;
+        }
+    }
+    for endpoint in &mut ep {
+        for c in endpoint {
+            *c = unquant(*c, PREC[m], signed);
+        }
+    }
+    let pal = palette(&ep, m, signed);
+    let p = if m < 10 {
+        ((bits >> 77) & 31) as usize
+    } else {
+        0
+    };
+    let mut pos = if m < 10 { 82 } else { 65 };
+    let mut out = [[0; 3]; 16];
+    for (i, pixel) in out.iter_mut().enumerate() {
+        let n = if m < 10 { 3 } else { 4 } - usize::from(anchor(m, p, i));
+        let idx = ((bits >> pos) & ((1 << n) - 1)) as usize;
+        *pixel = pal[pattern(m, p, i)][idx];
+        pos += n;
+    }
+    out
+}
+// libm avoids platform libc variation; all search comparisons are f64.
+pub(crate) fn perceptual(x: f32) -> f64 {
+    let a = libm::log2(1.0 + 16.0 * f64::from(x.abs()));
+    if x < 0.0 {
+        -a
+    } else {
+        a
+    }
+}
+fn quant(x: i32, m: usize, signed: bool) -> i32 {
+    let (mut lo, mut hi) = if signed {
+        (-(1 << (PREC[m] - 1)) + 1, (1 << (PREC[m] - 1)) - 1)
+    } else {
+        (0, (1 << PREC[m]) - 1)
+    };
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if unquant(mid, PREC[m], signed) < x {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if lo > if signed { -(1 << (PREC[m] - 1)) + 1 } else { 0 }
+        && (unquant(lo - 1, PREC[m], signed) - x).abs() <= (unquant(lo, PREC[m], signed) - x).abs()
+    {
+        lo - 1
+    } else {
+        lo
+    }
+}
+fn packed(
+    ep: &[[i32; 3]; 4],
+    m: usize,
+    p: usize,
+    idx: &[usize; 16],
+    _signed: bool,
+) -> Option<[u8; 16]> {
+    let mut raw = [0i32; 12];
+    for e in 0..if m < 10 { 4 } else { 2 } {
+        for c in 0..3 {
+            let mask = (1 << PREC[m]) - 1;
+            let q = ep[e][c];
+            let value = if e > 0 && transformed(m) {
+                let d = sign((q - ep[0][c]) & mask, PREC[m]);
+                let bound = 1 << (DELTA[m][c] - 1);
+                if d < -bound || d >= bound {
+                    return None;
+                }
+                d & ((1 << DELTA[m][c]) - 1)
+            } else {
+                q & mask
+            };
+            raw[e * 3 + c] = value;
+        }
+    }
+    let mut bits = u128::from(MODES[m]);
+    for (pos, &(e, b)) in layout::LAYOUT[m].iter().enumerate() {
+        if e != 255 && raw[usize::from(e)] & (1 << b) != 0 {
+            bits |= 1 << pos;
+        }
+    }
+    if m < 10 {
+        bits |= u128::try_from(p).ok()? << 77;
+    }
+    let mut pos = if m < 10 { 82 } else { 65 };
+    for (i, &v) in idx.iter().enumerate() {
+        let n = if m < 10 { 3 } else { 4 } - usize::from(anchor(m, p, i));
+        if v >= 1 << n {
+            return None;
+        }
+        bits |= u128::try_from(v).ok()? << pos;
+        pos += n;
+    }
+    Some(bits.to_le_bytes())
+}
+fn score(
+    ep: &[[i32; 3]; 4],
+    src: &[[f64; 3]; 16],
+    m: usize,
+    p: usize,
+    signed: bool,
+) -> (f64, [usize; 16]) {
+    let mut unq = *ep;
+    for e in &mut unq {
+        for c in e {
+            *c = unquant(*c, PREC[m], signed);
+        }
+    }
+    let pal = palette(&unq, m, signed);
+    let mut log = [[[0.0; 3]; 16]; 2];
+    for s in 0..if m < 10 { 2 } else { 1 } {
+        for k in 0..weights(m).len() {
+            for c in 0..3 {
+                log[s][k][c] = perceptual(half(pal[s][k][c]));
+            }
+        }
+    }
+    let mut total = 0.0;
+    let mut idx = [0; 16];
+    for i in 0..16 {
+        let s = pattern(m, p, i);
+        let mut best = f64::INFINITY;
+        for (k, color) in log[s]
+            .iter()
+            .enumerate()
+            .take(weights(m).len() >> usize::from(anchor(m, p, i)))
+        {
+            let mut error = 0.0;
+            for c in 0..3 {
+                let d = src[i][c] - color[c];
+                error += d * d;
+            }
+            if error < best {
+                best = error;
+                idx[i] = k;
+            }
+        }
+        total += best;
+    }
+    (total, idx)
+}
+// Damped Gauss-Newton fitting in the decoded perceptual objective. The
+// Jacobian is measured in the integer interpolation domain, including half
+// reconstruction; reassignment after each accepted step handles selector moves.
+fn fit(
+    ep: &mut [[i32; 3]; 4],
+    src: &[[f64; 3]; 16],
+    m: usize,
+    p: usize,
+    signed: bool,
+    rounds: usize,
+) {
+    let mut current = score(ep, src, m, p, signed);
+    for _ in 0..rounds {
+        let mut unq = *ep;
+        for e in &mut unq {
+            for c in e {
+                *c = unquant(*c, PREC[m], signed);
+            }
+        }
+        let mut deltas = [[0.0; 3]; 4];
+        for s in 0..if m < 10 { 2 } else { 1 } {
+            for c in 0..3 {
+                let (mut aa, mut ab, mut bb, mut ra, mut rb) = (0.0, 0.0, 0.0, 0.0, 0.0);
+                for (i, pixel) in src.iter().enumerate() {
+                    if pattern(m, p, i) != s {
+                        continue;
+                    }
+                    let w = weights(m)[current.1[i]];
+                    let u = (unq[2 * s][c] * (64 - w) + unq[2 * s + 1][c] * w + 32) >> 6;
+                    let lo = (u - 32).max(if signed { -32767 } else { 0 });
+                    let hi = (u + 32).min(if signed { 32767 } else { 65535 });
+                    let derivative = (perceptual(half(finish(hi, signed)))
+                        - perceptual(half(finish(lo, signed))))
+                        / f64::from(hi - lo);
+                    let a = f64::from(64 - w) / 64.0 * derivative;
+                    let b = f64::from(w) / 64.0 * derivative;
+                    let r = pixel[c] - perceptual(half(finish(u, signed)));
+                    aa += a * a;
+                    ab += a * b;
+                    bb += b * b;
+                    ra += a * r;
+                    rb += b * r;
+                }
+                let determinant = aa * bb - ab * ab;
+                if determinant > 1e-30 {
+                    deltas[2 * s][c] = (ra * bb - rb * ab) / determinant;
+                    deltas[2 * s + 1][c] = (rb * aa - ra * ab) / determinant;
+                }
+            }
+        }
+        let mut accepted = false;
+        for damping in [1.0, 0.5, 0.25] {
+            let mut trial = *ep;
+            for e in 0..if m < 10 { 4 } else { 2 } {
+                for c in 0..3 {
+                    let target =
+                        (f64::from(unq[e][c]) + damping * deltas[e][c]).clamp(-65535.0, 65535.0);
+                    trial[e][c] = quant(libm::round(target) as i32, m, signed);
+                }
+            }
+            if packed(&trial, m, p, &[0; 16], signed).is_none() {
+                continue;
+            }
+            let next = score(&trial, src, m, p, signed);
+            if next.0 < current.0 {
+                *ep = trial;
+                current = next;
+                accepted = true;
+                break;
+            }
+        }
+        if !accepted {
+            break;
+        }
+    }
+}
+type Candidate = ([[i32; 3]; 4], usize, usize);
+pub(crate) fn encode(pixels: &[[f32; 3]; 16], signed: bool, effort: Effort) -> [u8; 16] {
+    search(pixels, signed, effort).0
+}
+fn search(pixels: &[[f32; 3]; 16], signed: bool, effort: Effort) -> ([u8; 16], Option<Candidate>) {
+    let src = pixels.map(|p| p.map(perceptual));
+    let domain = pixels.map(|p| {
+        p.map(|x| {
+            // Invert final scaling in the integer half domain. Binary search avoids
+            // any dependence on the host's float-to-half instruction rounding.
+            let mut lo = 0u16;
+            let mut hi = 31743u16;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if half(mid) < x.abs() {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            let a = i32::from(lo) * if signed { 32 } else { 64 } / 31;
+            if x < 0.0 {
+                -a
+            } else {
+                a
+            }
+        })
+    });
+    let mut best = f64::INFINITY;
+    let mut result = [0; 16];
+    let mut winner = None;
+    if effort != Effort::Fast {
+        let previous = search(
+            pixels,
+            signed,
+            if effort == Effort::Balanced {
+                Effort::Fast
+            } else {
+                Effort::Balanced
+            },
+        );
+        result = previous.0;
+        winner = previous.1;
+        best = 0.0;
+        for (i, p) in decode(&result, signed).iter().enumerate() {
+            for c in 0..3 {
+                let d = src[i][c] - perceptual(half(p[c]));
+                best += d * d;
+            }
+        }
+    }
+    for p in 0..32 {
+        for m in 0..14 {
+            if m >= 10 && p != 0 {
+                continue;
+            }
+            let mut endpoints = [[0; 3]; 4];
+            for s in 0..if m < 10 { 2 } else { 1 } {
+                // Farthest pair in perceptual RGB preserves opposing gradients.
+                let mut dist = -1.0;
+                let mut pair = (0, 0);
+                for a in 0..16 {
+                    if pattern(m, p, a) != s {
+                        continue;
+                    }
+                    for b in a..16 {
+                        if pattern(m, p, b) != s {
+                            continue;
+                        }
+                        let mut d = 0.0;
+                        for (&a, &b) in src[a].iter().zip(&src[b]) {
+                            let v = a - b;
+                            d += v * v;
+                        }
+                        if d > dist {
+                            dist = d;
+                            pair = (a, b);
+                        }
+                    }
+                }
+                endpoints[2 * s] = domain[pair.0].map(|x| quant(x, m, signed));
+                endpoints[2 * s + 1] = domain[pair.1].map(|x| quant(x, m, signed));
+            }
+            // All endpoint orientations are considered before delta admission.
+            for flip in 0..if m < 10 { 4 } else { 2 } {
+                let mut ep = endpoints;
+                for s in 0..if m < 10 { 2 } else { 1 } {
+                    if flip & (1 << s) != 0 {
+                        ep.swap(2 * s, 2 * s + 1);
+                    }
+                }
+                if packed(&ep, m, p, &[0; 16], signed).is_none() {
+                    continue;
+                }
+                let (error, idx) = score(&ep, &src, m, p, signed);
+                if error < best {
+                    if let Some(block) = packed(&ep, m, p, &idx, signed) {
+                        best = error;
+                        result = block;
+                        winner = Some((ep, m, p));
+                    }
+                }
+            }
+        }
+    }
+    // Bounded coordinate refinement of the winning quantized endpoints.
+    if let Some((mut ep, m, p)) = winner {
+        fit(
+            &mut ep,
+            &src,
+            m,
+            p,
+            signed,
+            match effort {
+                Effort::Fast => 8,
+                Effort::Balanced => 12,
+                Effort::Quality => 16,
+            },
+        );
+        let (error, idx) = score(&ep, &src, m, p, signed);
+        if error < best {
+            if let Some(block) = packed(&ep, m, p, &idx, signed) {
+                best = error;
+                result = block;
+            }
+        }
+        let rounds = match effort {
+            Effort::Fast => 1,
+            Effort::Balanced => 2,
+            Effort::Quality => 3,
+        };
+        for _ in 0..rounds {
+            for e in 0..if m < 10 { 4 } else { 2 } {
+                for c in 0..3 {
+                    for step in [-16, -4, -1, 1, 4, 16] {
+                        let mut trial = ep;
+                        let value = trial[e][c] + step;
+                        let (lo, hi) = if signed {
+                            (-(1 << (PREC[m] - 1)) + 1, (1 << (PREC[m] - 1)) - 1)
+                        } else {
+                            (0, (1 << PREC[m]) - 1)
+                        };
+                        if value < lo || value > hi {
+                            continue;
+                        }
+                        trial[e][c] = value;
+                        let (error, idx) = score(&trial, &src, m, p, signed);
+                        if error < best {
+                            if let Some(block) = packed(&trial, m, p, &idx, signed) {
+                                best = error;
+                                result = block;
+                                ep = trial;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        winner = Some((ep, m, p));
+    }
+    (result, winner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn all_mode_partition_packers_are_admitted() {
+        for signed in [false, true] {
+            for (m, _) in PREC.iter().enumerate() {
+                for p in 0..if m < 10 { 32 } else { 1 } {
+                    let ep = [[if signed { -2 } else { 2 }; 3]; 4];
+                    let idx = [0; 16];
+                    let b = packed(&ep, m, p, &idx, signed).expect("representable equal endpoints");
+                    let expected = [finish(unquant(ep[0][0], PREC[m], signed), signed); 3];
+                    assert_eq!(decode(&b, signed), [expected; 16]);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn khronos_signed_zero_restores_pre_scale_sign() {
+    // Section 20.2: (abs(i)*31)>>5, with the sign bit taken from i.
+    assert_eq!(finish(-1, true), 0x8000);
+    let ep = [[-1; 3]; 4];
+    let block = packed(&ep, 13, 0, &[0; 16], true).expect("mode 15 represents -1 exactly");
+    assert_eq!(decode(&block, true), [[0x8000; 3]; 16]);
+}

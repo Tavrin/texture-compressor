@@ -1,6 +1,6 @@
 # texture-compressor
 
-Encode decoded pixels into GPU block-compressed BC1, BC3, BC4, BC5 and BC7
+Encode decoded pixels into GPU block-compressed BC1, BC3, BC4, BC5, BC6H and BC7
 textures with Fast, Balanced and Quality search presets. Encoding is
 deterministic for a given input and settings. The crate supports native and
 WebAssembly targets. It returns raw blocks; it does not decode image files,
@@ -12,7 +12,7 @@ Requires Rust 1.98 or later (MSRV).
 
 ```toml
 [dependencies]
-texture-compressor = "0.1"
+texture-compressor = "0.2"
 ```
 
 The default features are `std` and `simd`. Unsafe code is confined to the
@@ -104,3 +104,91 @@ multi-thread performance or quality on every unseen texture.
 
 Licensed under either the [MIT licence](LICENSE-MIT) or the
 [Apache License, Version 2.0](LICENSE-APACHE), at your option.
+
+## HDR RGB to BC6H
+
+```rust
+use texture_compressor::{encode_hdr, decode_bc6h, Effort, Format, HdrImageView, Settings};
+let rgb = [2.0f32; 4 * 4 * 3];
+let image = HdrImageView::rgb_f32(&rgb, 4, 4, 12)?;
+let blocks = encode_hdr(image, &Settings::new(Format::Bc6hUf16, Effort::Balanced))?;
+let block: &[u8; 16] = blocks[..16].try_into().expect("one block");
+let half_rgb = decode_bc6h(block, Format::Bc6hUf16)?;
+assert_eq!(half_rgb.len(), 16);
+# Ok::<(), texture_compressor::Error>(())
+```
+
+`Bc6hUf16` stores unsigned HDR RGB; `Bc6hSf16` stores signed HDR RGB.
+`HdrImageView::{rgb_f32,rgba_f32}` borrow float slices;
+`{rgb_f16,rgba_f16}` borrow `u16` IEEE binary16 bit patterns.
+HDR strides count samples, not bytes. Alpha is ignored. `encode_hdr_into`
+writes into caller storage. Partial blocks replicate edge texels.
+The byte-input `encode` API rejects BC6H, and HDR encoding rejects other formats.
+NaN becomes zero; infinities and finite overflow clamp to ±65504. Unsigned
+encoding additionally clamps negative values to zero. Subnormal values are
+retained as input (compression can quantize them to zero); negative zero
+normalizes to zero. The decoder returns exact binary16 RGB bits for every
+mode and partition, including the signed format's possible negative infinity.
+Reserved modes decode to black.
+
+The encoder minimizes `Σ(T(source) - T(decoded))²` over RGB and texels,
+where `T(x) = sign(x) * log2(1 + 16 * abs(x))`. The software `libm` implementation
+and f64 accumulation keep this objective consistent across native and wasm.
+All presets search all fourteen modes and
+thirty-two partitions, including transformed endpoint admission and anchor
+constraints. Each preset retains the preceding preset's result, then applies
+damped Gauss-Newton fitting in the decoded objective and bounded endpoint
+coordinate refinement. Fast/Balanced/Quality allow 8/12/16 fitting iterations and 1/2/3 coordinate
+refinement rounds. The factor 16 gives shadow detail weight around radiance
+1/16 instead of 1. This is a scalar search.
+
+The normative source is [Khronos Data Format Specification 1.4, §20.2 BC6H,
+including the endpoint and block-layout tables](https://registry.khronos.org/DataFormat/specs/1.4/dataformat.1.4.html).
+The endpoint perturbation strategy was informed by reading
+[Microsoft DirectXTex](https://github.com/microsoft/DirectXTex/blob/main/DirectXTex/BC6HBC7.cpp);
+its implementation was not copied. Decoder conformance is checked against
+`bcdec_rs`, a dev-dependency only. Its signed-zero discrepancy is handled
+explicitly: Khronos preserves the pre-scaling negative sign even when the
+scaled magnitude becomes zero; a separate normative vector checks that bit. Intel's `intel_tex_2` is also dev-only.
+
+The pinned [corpus manifest](tests/bc6h_manifest.json) records 24 public HDRIs,
+source URLs, CC0 licences, source/crop SHA-256 hashes and center crop rectangles.
+Selection uses the first 24 alphabetically sorted public HDRI asset IDs;
+all crops are 64×64 with original radiance preserved. Recreate with
+`python3 tools/bc6h_corpus.py <external-directory>` (requires NumPy and OpenCV).
+Run `cargo run --release --example bc6h_measure -- <external-directory>` for
+paired timings (alternating order, three rounds, median; same first-image warmup)
+and quality against Intel fast/basic/slow settings for Fast/Balanced/Quality.
+Both quality metrics pool RGB texels across exposures `[-4,-2,0,2,4]` EV.
+Log RMSE compares `log2(1 + 2^EV*x)`. Exposure PSNR uses
+Reinhard display values `v = 2^EV*x / (1 + 2^EV*x)`, peak 1, and pooled MSE.
+Timing covers the complete corpus including allocations, excluding file I/O
+and decoding. The Intel comparison is unsigned only; Intel's wrapper does not
+expose signed encoding. These small fixed crops do not establish full-image
+performance or quality on other content.
+
+For native/wasm identity, build `bc6h_identity` for native and `wasm32-wasip1`,
+then compare its binary stdout on the same external corpus directory.
+`node tools/bc6h_wasi.cjs <binary.wasm> <external-directory>` runs the WASI
+version. The stream includes signed/unsigned corpus encoding and decoding,
+all presets, normalization cases, binary16 inputs, and arbitrary bitstreams
+covering every mode and partition. `examples/identity.rs` separately covers
+existing-format byte identity.
+
+### BC6H comparison
+
+Measured on 24 fixed 64×64 CC0 HDR crops with the methodology above.
+Each quality value pools all five exposures; times are median complete-corpus
+wall times from three alternating paired rounds on a shared AMD Ryzen 9
+7945HX host (x86_64 Linux, Rust 1.98.1, release profile, intel_tex_2 0.5.0).
+These are unsigned results; the independent decoder check covers both signs.
+
+| Preset / Intel preset | Log RMSE ours / Intel | Exposure PSNR ours / Intel (dB) | Encode ms ours / Intel |
+| --- | ---: | ---: | ---: |
+| Fast / fast | 0.017004 / 0.018640 | 47.37 / 46.84 | 4544.07 / 6.25 |
+| Balanced / basic | 0.016934 / 0.017845 | 47.40 / 47.10 | 9036.64 / 16.00 |
+| Quality / slow | 0.016932 / 0.017640 | 47.41 / 47.20 | 13780.91 / 78.49 |
+
+The Intel quality target passes on both aggregate metrics at all three presets.
+No encode-time target is claimed. Full-size images, other HDR content, signed
+quality against Intel, and hardware GPU decoding are not qualified by this run.

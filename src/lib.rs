@@ -12,6 +12,7 @@ use rayon::prelude::*;
 
 /// GPU block-compression format. BC4 and BC5 encode unsigned channels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Format {
     /// RGB with optional one-bit alpha, eight bytes per 4x4 block.
     Bc1,
@@ -23,9 +24,14 @@ pub enum Format {
     Bc5,
     /// RGBA, sixteen bytes per 4x4 block.
     Bc7,
+    /// Unsigned RGB half-float HDR, sixteen bytes per 4x4 block.
+    Bc6hUf16,
+    /// Signed RGB half-float HDR, sixteen bytes per 4x4 block.
+    Bc6hSf16,
 }
 /// Encoder search preset.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Effort {
     /// Limited search. BC7 fits each subset along its principal axis, refines
     /// endpoints by least squares, and searches further only where a block's
@@ -70,6 +76,7 @@ impl Settings {
 }
 /// Image validation or encoding failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// Width or height is zero.
     EmptyImage,
@@ -196,7 +203,7 @@ pub fn encoded_len(format: Format, width: u32, height: u32) -> Result<usize, Err
 fn block_size(format: Format) -> usize {
     match format {
         Format::Bc1 | Format::Bc4 => 8,
-        Format::Bc3 | Format::Bc5 | Format::Bc7 => 16,
+        Format::Bc3 | Format::Bc5 | Format::Bc7 | Format::Bc6hUf16 | Format::Bc6hSf16 => 16,
     }
 }
 
@@ -273,7 +280,9 @@ fn validate(
     settings: &Settings,
     output_len: usize,
 ) -> Result<(usize, usize), Error> {
-    if (matches!(settings.format, Format::Bc1 | Format::Bc3 | Format::Bc7) && image.channels != 4)
+    if matches!(settings.format, Format::Bc6hUf16 | Format::Bc6hSf16)
+        || (matches!(settings.format, Format::Bc1 | Format::Bc3 | Format::Bc7)
+            && image.channels != 4)
         || (settings.format == Format::Bc5 && !matches!(image.channels, 2 | 4))
         || (settings.format != Format::Bc1 && !matches!(settings.alpha, AlphaPolicy::Opaque))
     {
@@ -344,6 +353,7 @@ fn encode_row(image: ImageView<'_>, settings: &Settings, by: usize, row: &mut [u
                 dst[8..].copy_from_slice(&bc4::encode(&pixels, settings.effort, 1));
             }
             Format::Bc7 => dst.copy_from_slice(&bc7::encode(&pixels, settings.effort)),
+            Format::Bc6hUf16 | Format::Bc6hSf16 => unreachable!("validated byte input"),
         }
     }
 }
@@ -352,3 +362,7 @@ mod bc1;
 mod bc4;
 mod bc7;
 mod budget;
+
+mod bc6h;
+mod hdr;
+pub use hdr::{decode_bc6h, encode_hdr, encode_hdr_into, HdrImageView};

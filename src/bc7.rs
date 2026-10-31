@@ -4,7 +4,7 @@ use crate::Effort;
 #[path = "bc7_fast.rs"]
 mod fast;
 #[path = "bc7_tables.rs"]
-mod tables;
+pub(super) mod tables;
 #[cfg(test)]
 use tables::{ANCHOR2, ANCHOR3A, ANCHOR3B};
 use tables::{PART2, PART3};

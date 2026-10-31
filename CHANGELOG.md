@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.2.0] - Unreleased
+
+### Added
+
+- Signed and unsigned BC6H encoding from strided RGB(A) f32 and binary16
+  slices, HDR input normalization, and a bit-exact block decoder.
+- HDR perceptual objective, pinned CC0 corpus manifest, independent decoder
+  conformance tests and reproducible Intel comparison/wasm identity tools.
+
+### Changed
+
+- `Format`, `Effort`, and `Error` are now `#[non_exhaustive]`; downstream
+  matches need wildcard arms. `Format` gains `Bc6hUf16` and `Bc6hSf16`.
+- Version increases to 0.2.0 for these public enum changes.
+
 ## [0.1.1] - 2026-10-30
 
 - `Error` implements `Display`, and `std::error::Error` with the `std`

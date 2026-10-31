@@ -1,0 +1,458 @@
+[
+  {
+    "id": "aarfontein_dawn_2",
+    "source": "https://polyhaven.com/a/aarfontein_dawn_2",
+    "url": "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/1k/aarfontein_dawn_2_1k.hdr",
+    "license": "CC0-1.0",
+    "license_url": "https://polyhaven.com/license",
+    "sha256": "79baa8cd25de9eec22981f0d4531dfae28fc005160e4ed21f732a592b2398cc8",
+    "crop": [
+      480,
+      224,
+      64,
+      64
+    ],
+    "original_size": [
+      1024,
+      512
+    ],
+    "rgb32_sha256": "51c76b40e91e385d93e905675a64aa9e4af6710e9882b4a32794ecc926ddcffa"
+  },
+  {
+    "id": "aarfontein_dirt_road",
+    "source": "https://polyhaven.com/a/aarfontein_dirt_road",
+    "url": "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/1k/aarfontein_dirt_road_1k.hdr",
+    "license": "CC0-1.0",
+    "license_url": "https://polyhaven.com/license",
+    "sha256": "15e569c025238bc007b683e06e4b3b5bc9fcab1545a0f9052c9d1b35a5275937",
+    "crop": [
+      480,
+      224,
+      64,
+      64
+    ],
+    "original_size": [
+      1024,
+      512
+    ],
+    "rgb32_sha256": "9508935c3150fba0afb034f3ead251c94f5feef797d84e9ef4d91f8912989df3"
+  },
+  {
+    "id": "aarfontein_dusk",
+    "source": "https://polyhaven.com/a/aarfontein_dusk",
+    "url": "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/1k/aarfontein_dusk_1k.hdr",
+    "license": "CC0-1.0",
+    "license_url": "https://polyhaven.com/license",
+    "sha256": "934313b7ab01271542d51c6ed501d43f2c7b6f342e5e84dc5fbfb7b017b5a519",
+    "crop": [
+      480,
+      224,
+      64,
+      64
+    ],
+    "original_size": [
+      1024,
+      512
+    ],
+    "rgb32_sha256": "e17b76689d6c804c895fa2710afb22705322193d53b5a7643d57b9d2fb2ea7d4"
+  },
+  {
+    "id": "aarfontein_pan",
+    "source": "https://polyhaven.com/a/aarfontein_pan",
+    "url": "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/1k/aarfontein_pan_1k.hdr",
+    "license": "CC0-1.0",
+    "license_url": "https://polyhaven.com/license",
+    "sha256": "e82a92e5f1f4b93ced677f190aae4784d57032d956bc7e4605997215bcc038e7",
+    "crop": [
+      480,
+      224,
+      64,
+      64
+    ],
+    "original_size": [
+      1024,
+      512
+    ],
+    "rgb32_sha256": "909d56df4f7b9ec73529acf184ebc02a6c4996b951ec66eceacd18ada7cdcd68"
+  },
+  {
+    "id": "aarfontein_sunrise",
+    "source": "https://polyhaven.com/a/aarfontein_sunrise",
+    "url": "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/1k/aarfontein_sunrise_1k.hdr",
+    "license": "CC0-1.0",
+    "license_url": "https://polyhaven.com/license",
+    "sha256": "f20d5d171ce61d87a95b0d7c2871aba96892d1d38c85a9a3b4a0df4eed5e7329",
+    "crop": [
+      480,
+      224,
+      64,
+      64
+    ],
+    "original_size": [
+      1024,
+      512
+    ],
+    "rgb32_sha256": "2bc975b0ea9d21609f6425cb291af3d0d4bcd844902f0ab0ffa475113d355dac"
+  },
+  {
+    "id": "abandoned_bakery",
+    "source": "https://polyhaven.com/a/abandoned_bakery",
+    "url": "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/1k/abandoned_bakery_1k.hdr",
+    "license": "CC0-1.0",
+    "license_url": "https://polyhaven.com/license",
+    "sha256": "e4cbde5721d3d4d6d76de5444a430f3bfaaa08a48044ce30e7c50d8cd1200d5b",
+    "crop": [
+      480,
+      224,
+      64,
+      64
+    ],
+    "original_size": [
+      1024,
+      512
+    ],
+    "rgb32_sha256": "dffdc76e81388b630e2732be568909c2a34f5c13bb4bbbf48eeb32ecdf041421"
+  },
+  {
+    "id": "abandoned_church",
+    "source": "https://polyhaven.com/a/abandoned_church",
+    "url": "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/1k/abandoned_church_1k.hdr",
+    "license": "CC0-1.0",
+    "license_url": "https://polyhaven.com/license",
+    "sha256": "a0f8d17f4117533c466e3c4a937cf9ea131c0337ac57be7070844959ba060965",
+    "crop": [
+      480,
+      224,
+      64,
+      64
+    ],
+    "original_size": [
+      1024,
+      512
+    ],
+    "rgb32_sha256": "bdf70599bd5dbd4e1c8c6b1bc676110853a19af04667c1daf1c3b1eb63be3238"
+  },
+  {
+    "id": "abandoned_construction",
+    "source": "https://polyhaven.com/a/abandoned_construction",
+    "url": "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/1k/abandoned_construction_1k.hdr",
+    "license": "CC0-1.0",
+    "license_url": "https://polyhaven.com/license",
+    "sha256": "44eb0b4d765f18708b696459c1e2fcde620b2a468e78960efac6ebd6e71d3aa3",
+    "crop": [
+      480,
+      224,
+      64,
+      64
+    ],
+    "original_size": [
+      1024,
+      512
+    ],
+    "rgb32_sha256": "a6f965bcf5003d0bbf8dfdb487616979189fdcedded4ef62e2094266c167246f"
+  },
+  {
+    "id": "abandoned_factory_canteen_01",
+    "source": "https://polyhaven.com/a/abandoned_factory_canteen_01",
+    "url": "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/1k/abandoned_factory_canteen_01_1k.hdr",
+    "license": "CC0-1.0",
+    "license_url": "https://polyhaven.com/license",
+    "sha256": "73a29dbe6fe6e4e2ec26a430fa9e9f4b39c8b72a0990e9330381d20f68479f4c",
+    "crop": [
+      480,
+      224,
+      64,
+      64
+    ],
+    "original_size": [
+      1024,
+      512
+    ],
+    "rgb32_sha256": "c4c0fdf887d3791b1f0f4905905f9798d9771ec484b6e08980a495daac5774ff"
+  },
+  {
+    "id": "abandoned_factory_canteen_02",
+    "source": "https://polyhaven.com/a/abandoned_factory_canteen_02",
+    "url": "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/1k/abandoned_factory_canteen_02_1k.hdr",
+    "license": "CC0-1.0",
+    "license_url": "https://polyhaven.com/license",
+    "sha256": "4257af72173b265db3cc5075812fe661f86174c6e5f5bdfc52913125f3a724b8",
+    "crop": [
+      480,
+      224,
+      64,
+      64
+    ],
+    "original_size": [
+      1024,
+      512
+    ],
+    "rgb32_sha256": "25e6a78f84f14019e4685f3586c4842d6887b5bf75c7c54419246b74dd52378a"
+  },
+  {
+    "id": "abandoned_games_room_01",
+    "source": "https://polyhaven.com/a/abandoned_games_room_01",
+    "url": "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/1k/abandoned_games_room_01_1k.hdr",
+    "license": "CC0-1.0",
+    "license_url": "https://polyhaven.com/license",
+    "sha256": "a94c3bc4540e6ee4590a0480a6947ee9258572fc41e1f317f921618775998f24",
+    "crop": [
+      480,
+      224,
+      64,
+      64
+    ],
+    "original_size": [
+      1024,
+      512
+    ],
+    "rgb32_sha256": "3e71c8ef4f688c7142256a1f3c07b771cd866a78dbbff2a4808a726afca6ae0c"
+  },
+  {
+    "id": "abandoned_games_room_02",
+    "source": "https://polyhaven.com/a/abandoned_games_room_02",
+    "url": "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/1k/abandoned_games_room_02_1k.hdr",
+    "license": "CC0-1.0",
+    "license_url": "https://polyhaven.com/license",
+    "sha256": "30933f1acb31dce62d2977e6b55361d698fcdfbddc80ac03f2311543f7184046",
+    "crop": [
+      480,
+      224,
+      64,
+      64
+    ],
+    "original_size": [
+      1024,
+      512
+    ],
+    "rgb32_sha256": "bd28689c4c9d9e375ef1a4ae550f73a65092b1f8b379f225a6a55ffa331510ea"
+  },
+  {
+    "id": "abandoned_garage",
+    "source": "https://polyhaven.com/a/abandoned_garage",
+    "url": "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/1k/abandoned_garage_1k.hdr",
+    "license": "CC0-1.0",
+    "license_url": "https://polyhaven.com/license",
+    "sha256": "ed3fb1003d981d4737299e38894f2ed50a585f265e664057cf3572618e6e96c7",
+    "crop": [
+      480,
+      224,
+      64,
+      64
+    ],
+    "original_size": [
+      1024,
+      512
+    ],
+    "rgb32_sha256": "2d00739d2b1b6cefad0d08ec20a2b314c694ac732c1d237354db33716ab539bd"
+  },
+  {
+    "id": "abandoned_greenhouse",
+    "source": "https://polyhaven.com/a/abandoned_greenhouse",
+    "url": "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/1k/abandoned_greenhouse_1k.hdr",
+    "license": "CC0-1.0",
+    "license_url": "https://polyhaven.com/license",
+    "sha256": "d6c3d214ecbb76a1e132bc9b5afe7d1c98fdb5f106ff598077f23bd3e566b466",
+    "crop": [
+      480,
+      224,
+      64,
+      64
+    ],
+    "original_size": [
+      1024,
+      512
+    ],
+    "rgb32_sha256": "711d80ffd976a145e60700917adb3293d39842591363e6090aaa75d4de9bf72f"
+  },
+  {
+    "id": "abandoned_hall_01",
+    "source": "https://polyhaven.com/a/abandoned_hall_01",
+    "url": "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/1k/abandoned_hall_01_1k.hdr",
+    "license": "CC0-1.0",
+    "license_url": "https://polyhaven.com/license",
+    "sha256": "f16c526542d633b2be92fcf14d3fe9edb757c99895d772c199b02031d28daa76",
+    "crop": [
+      480,
+      224,
+      64,
+      64
+    ],
+    "original_size": [
+      1024,
+      512
+    ],
+    "rgb32_sha256": "240726a035450e70873b3eecc20ee126181b4c5ac45436335a180fd617d96e5f"
+  },
+  {
+    "id": "abandoned_hopper_terminal_01",
+    "source": "https://polyhaven.com/a/abandoned_hopper_terminal_01",
+    "url": "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/1k/abandoned_hopper_terminal_01_1k.hdr",
+    "license": "CC0-1.0",
+    "license_url": "https://polyhaven.com/license",
+    "sha256": "461ee057ff980a83e70dc8a189254dc3a2ecd81f1cc0d8c4b75670da69b99ba8",
+    "crop": [
+      480,
+      224,
+      64,
+      64
+    ],
+    "original_size": [
+      1024,
+      512
+    ],
+    "rgb32_sha256": "e9b7632127d3bd78db1f6edca0958819bb51d1f32dc1237c331d3aee203a5f24"
+  },
+  {
+    "id": "abandoned_hopper_terminal_02",
+    "source": "https://polyhaven.com/a/abandoned_hopper_terminal_02",
+    "url": "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/1k/abandoned_hopper_terminal_02_1k.hdr",
+    "license": "CC0-1.0",
+    "license_url": "https://polyhaven.com/license",
+    "sha256": "0aa221014ad9000f227ab4970ac291b85af7e52d6ca025e30c504088c28fda82",
+    "crop": [
+      480,
+      224,
+      64,
+      64
+    ],
+    "original_size": [
+      1024,
+      512
+    ],
+    "rgb32_sha256": "10fad9ed755245767f3c65de08e2d5f06e51e2429b5cf73f759e8b18d72c8ba6"
+  },
+  {
+    "id": "abandoned_hopper_terminal_03",
+    "source": "https://polyhaven.com/a/abandoned_hopper_terminal_03",
+    "url": "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/1k/abandoned_hopper_terminal_03_1k.hdr",
+    "license": "CC0-1.0",
+    "license_url": "https://polyhaven.com/license",
+    "sha256": "4681d1c69363a0185276f82357b669a15a1c5e3a6b1aae6b693b741e04f426ee",
+    "crop": [
+      480,
+      224,
+      64,
+      64
+    ],
+    "original_size": [
+      1024,
+      512
+    ],
+    "rgb32_sha256": "9c73d63655943ad3deb9988d8f47da99665653ba9032228b3f0b32c639bd9c6a"
+  },
+  {
+    "id": "abandoned_hopper_terminal_04",
+    "source": "https://polyhaven.com/a/abandoned_hopper_terminal_04",
+    "url": "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/1k/abandoned_hopper_terminal_04_1k.hdr",
+    "license": "CC0-1.0",
+    "license_url": "https://polyhaven.com/license",
+    "sha256": "d86ab24d9492294c0db2a756cc366b076ec3525d7c16a820192eedd9eaf0736a",
+    "crop": [
+      480,
+      224,
+      64,
+      64
+    ],
+    "original_size": [
+      1024,
+      512
+    ],
+    "rgb32_sha256": "c453fb88ef2ff0c112c26009a8863040d266bec58f738ef672e89e9bcbb631a8"
+  },
+  {
+    "id": "abandoned_parking",
+    "source": "https://polyhaven.com/a/abandoned_parking",
+    "url": "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/1k/abandoned_parking_1k.hdr",
+    "license": "CC0-1.0",
+    "license_url": "https://polyhaven.com/license",
+    "sha256": "6318a3b1e8c219012d51c25c48aac0de40a41d6e082ac241c9a79a2ddc4b1069",
+    "crop": [
+      480,
+      224,
+      64,
+      64
+    ],
+    "original_size": [
+      1024,
+      512
+    ],
+    "rgb32_sha256": "9f0c3b0f2c6316d812c3e90ce84ac14bc60de485740a988e9b17714e5c73a99b"
+  },
+  {
+    "id": "abandoned_pathway",
+    "source": "https://polyhaven.com/a/abandoned_pathway",
+    "url": "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/1k/abandoned_pathway_1k.hdr",
+    "license": "CC0-1.0",
+    "license_url": "https://polyhaven.com/license",
+    "sha256": "38817eec7a3c2b81f6da2c8a2c9465370b5e273118ddd597359a6ec3b5818ef0",
+    "crop": [
+      480,
+      224,
+      64,
+      64
+    ],
+    "original_size": [
+      1024,
+      512
+    ],
+    "rgb32_sha256": "4ea125f02ed1f8f7765869fc5fd4ab9eaa935b0e7ee18269da08d7c66cf960f7"
+  },
+  {
+    "id": "abandoned_slipway",
+    "source": "https://polyhaven.com/a/abandoned_slipway",
+    "url": "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/1k/abandoned_slipway_1k.hdr",
+    "license": "CC0-1.0",
+    "license_url": "https://polyhaven.com/license",
+    "sha256": "6ed71222217c1c443f52c847d9dd6e16fdef53716c955d352240d44218c42572",
+    "crop": [
+      480,
+      224,
+      64,
+      64
+    ],
+    "original_size": [
+      1024,
+      512
+    ],
+    "rgb32_sha256": "83e66ad59488ae4b5f3d716d44e79ff32ba3795b31a7c61a0089fdd06338a955"
+  },
+  {
+    "id": "abandoned_tank_farm_01",
+    "source": "https://polyhaven.com/a/abandoned_tank_farm_01",
+    "url": "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/1k/abandoned_tank_farm_01_1k.hdr",
+    "license": "CC0-1.0",
+    "license_url": "https://polyhaven.com/license",
+    "sha256": "6cc11a88e0a6a0059114eb6574d442c6f06a05e4320fc7891195cc2a1a9d7f89",
+    "crop": [
+      480,
+      224,
+      64,
+      64
+    ],
+    "original_size": [
+      1024,
+      512
+    ],
+    "rgb32_sha256": "b92eb54bfdba762c104981787d56b8d77a594d139f54f0e03671b82661752dea"
+  },
+  {
+    "id": "abandoned_tank_farm_02",
+    "source": "https://polyhaven.com/a/abandoned_tank_farm_02",
+    "url": "https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/1k/abandoned_tank_farm_02_1k.hdr",
+    "license": "CC0-1.0",
+    "license_url": "https://polyhaven.com/license",
+    "sha256": "887901136619e7f5dde1d55bd3e2df894e65bb3677b973bd7b752ea3581322f8",
+    "crop": [
+      480,
+      224,
+      64,
+      64
+    ],
+    "original_size": [
+      1024,
+      512
+    ],
+    "rgb32_sha256": "0aeab42124eafc6b216c484ff7686970f3c2d9c534769c38dba758bea4683bc6"
+  }
+]
