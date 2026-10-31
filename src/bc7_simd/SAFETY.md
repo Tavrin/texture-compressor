@@ -70,3 +70,38 @@ On std x86, AVX2 dispatch uses SSE4.1 with four elements for the unweighted wind
 only after an independent runtime SSE4.1 check. Weighted palettes, seeds,
 polish and estimates retain their selected backend. No new unsafe block
 or unchecked memory operation is added.
+
+`byte_lookup` checks SSSE3 explicitly before its target-feature kernel. Fixed
+arrays permit exactly 16/8-byte input loads and a 16-byte output store. Range
+fitting supplies offsets 0..7; PSHUFB itself never performs indexed memory reads.
+
+
+`byte_bounds` uses baseline x86_64 SSE2 only. Its fixed `[u8; 16]` reference
+permits one unaligned sixteen-byte read. The unsigned min/max reduction tree
+uses registers only; extraction reads the low byte after combining every input.
+There are no stores, feature-dependent dispatch or floating-point operations.
+
+`byte_search` explicitly checks SSSE3 and uses fixed 16/7-byte arguments.
+The seven bounds are copied into an eight-byte local before the eight-byte
+load. All indexed lookup is register-only PSHUFB; binary-search positions
+are 0..7. Used wide-range boundaries are >=1, making x > boundary-1 exact
+under the signed-byte bias. The unused eighth entry never participates in a
+boundary comparison. The output is a fixed sixteen-byte array.
+
+`range_channel` explicitly checks SSSE3 and returns the packed eight-byte
+fit directly. Fixed arrays permit its sixteen-byte source and packed-word
+accesses and eight-byte table loads. The same exact boundary, register lookup,
+and selector compaction contracts above apply. The table's unused eighth byte
+never participates in a comparison. No floating-point operations are used.
+
+`RangeEncoder` has a private field and is constructed only after an explicit
+SSSE3 check. Its safe encode method may therefore reuse that immutable ISA
+proof for a whole block row. Its input remains a fixed sixteen-byte array;
+all range_channel memory and arithmetic contracts remain the same.
+
+`Sse41RangeEncoder` checks SSSE3 and SSE4.1 independently before private
+construction. The reduction first combines corresponding lower/upper bytes,
+then zero-extends the eight results to u16 for PHMINPOSUW. Max uses the same
+unsigned minimum on complemented byte maxima. Values remain 0..255, and the
+minpos index bits are ignored by extracting only the low byte. All source,
+table and packed-output accesses retain the same fixed-array contracts.

@@ -307,6 +307,18 @@ fn validate(
 }
 
 fn encode_row(image: ImageView<'_>, settings: &Settings, by: usize, row: &mut [u8]) {
+    if settings.format == Format::Bc5
+        && settings.bc45_fit == Bc45Fit::PeakBounded
+        && settings.effort != Effort::Quality
+    {
+        if image.channels == 4 {
+            encode_peak_row::<4>(image, by, row);
+        } else {
+            encode_peak_row::<2>(image, by, row);
+        }
+        return;
+    }
+
     #[cfg(feature = "simd")]
     if settings.format == Format::Bc7 && settings.effort != Effort::Fast {
         let lanes = bc7::batch_width();
@@ -378,3 +390,112 @@ mod bc1;
 mod bc4;
 mod bc7;
 mod budget;
+
+// Stage only the two fitted channels, and keep their output widths static.
+// The generic row encoder remains the path for defaults and Quality.
+fn encode_peak_row<const CHANNELS: usize>(image: ImageView<'_>, by: usize, row: &mut [u8]) {
+    #[cfg(all(feature = "simd", feature = "std", target_arch = "x86_64"))]
+    if let Some(encoder) = bc7::range_encoder_sse41() {
+        encode_peak_row_with::<CHANNELS>(image, by, row, |values| encoder.encode(values));
+        return;
+    }
+    #[cfg(all(feature = "simd", feature = "std", target_arch = "x86_64"))]
+    if let Some(encoder) = bc7::range_encoder() {
+        encode_peak_row_with::<CHANNELS>(image, by, row, |values| encoder.encode(values));
+        return;
+    }
+    encode_peak_row_with::<CHANNELS>(image, by, row, bc4::range_fit_values);
+}
+
+fn encode_peak_row_with<const CHANNELS: usize>(
+    image: ImageView<'_>,
+    by: usize,
+    row: &mut [u8],
+    fit: impl Fn(&[u8; 16]) -> [u8; 8],
+) {
+    let source_rows: [usize; 4] =
+        core::array::from_fn(|y| (by * 4 + y).min(image.height as usize - 1) * image.stride);
+    for (bx, dst) in row.as_chunks_mut::<16>().0.iter_mut().enumerate() {
+        let mut red = [0; 16];
+        let mut green = [0; 16];
+        let complete = bx < image.width as usize / 4;
+        for (y, &source_row) in source_rows.iter().enumerate() {
+            if complete {
+                // One checked span per source row; each texel index is fixed.
+                let start = source_row + bx * 4 * CHANNELS;
+                let source = &image.data[start..start + 4 * CHANNELS];
+                for x in 0..4 {
+                    red[y * 4 + x] = source[x * CHANNELS];
+                    green[y * 4 + x] = source[x * CHANNELS + 1];
+                }
+            } else {
+                for x in 0..4 {
+                    let px = (bx * 4 + x).min(image.width as usize - 1);
+                    let off = source_row + px * CHANNELS;
+                    red[y * 4 + x] = image.data[off];
+                    green[y * 4 + x] = image.data[off + 1];
+                }
+            }
+        }
+        dst[..8].copy_from_slice(&fit(&red));
+        dst[8..16].copy_from_slice(&fit(&green));
+    }
+}
+
+#[cfg(test)]
+mod peak_row_tests {
+    use super::*;
+
+    #[test]
+    fn peak_rows_match_block_path_with_padding_and_strides() -> Result<(), Error> {
+        for channels in [2, 4] {
+            for width in [1, 3, 4, 5, 13] {
+                for height in [1, 3, 4, 7] {
+                    let stride = width * channels + 7;
+                    let mut data = alloc::vec![0; stride * height];
+                    for (byte, value) in data.iter_mut().zip((0..=255u8).cycle()) {
+                        *byte = value;
+                    }
+                    let image = if channels == 2 {
+                        ImageView::rg8(
+                            &data,
+                            u32::try_from(width).map_err(|_| Error::Overflow)?,
+                            u32::try_from(height).map_err(|_| Error::Overflow)?,
+                            stride,
+                        )?
+                    } else {
+                        ImageView::rgba8(
+                            &data,
+                            u32::try_from(width).map_err(|_| Error::Overflow)?,
+                            u32::try_from(height).map_err(|_| Error::Overflow)?,
+                            stride,
+                        )?
+                    };
+                    for effort in [Effort::Fast, Effort::Balanced] {
+                        let mut settings = Settings::new(Format::Bc5, effort);
+                        settings.bc45_fit = Bc45Fit::PeakBounded;
+                        let actual = encode(image, &settings)?;
+                        let mut expected = Vec::new();
+                        for by in 0..height.div_ceil(4) {
+                            for bx in 0..width.div_ceil(4) {
+                                let pixels = core::array::from_fn(|i| {
+                                    let x = (bx * 4 + i % 4).min(width - 1);
+                                    let y = (by * 4 + i / 4).min(height - 1);
+                                    let off = y * stride + x * channels;
+                                    [data[off], data[off + 1], 0, 255]
+                                });
+                                expected.extend_from_slice(&bc4::encode_pair(
+                                    &pixels,
+                                    effort,
+                                    Bc45Fit::PeakBounded,
+                                ));
+                            }
+                        }
+                        assert_eq!(actual, expected, "{channels} {width} {height} {effort:?}");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
