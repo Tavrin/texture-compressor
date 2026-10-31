@@ -129,25 +129,31 @@ pub fn encode_hdr_into(
     let w = usize::try_from(image.width).map_err(|_| Error::Overflow)?;
     let h = usize::try_from(image.height).map_err(|_| Error::Overflow)?;
     let bw = w.div_ceil(4);
-    for (i, dst) in out[..len].as_chunks_mut::<16>().0.iter_mut().enumerate() {
-        let mut pixels = [[0.0; 3]; 16];
-        for (j, p) in pixels.iter_mut().enumerate() {
-            let x = (i % bw * 4 + j % 4).min(w - 1);
-            let y = (i / bw * 4 + j / 4).min(h - 1);
-            for (c, v) in p.iter_mut().enumerate() {
-                let off = y * image.stride + x * image.channels + c;
-                let x = match image.data {
-                    Samples::Half(s) => bc6h::half(s[off]),
-                    Samples::Float(s) => s[off],
-                };
-                *v = if x.is_nan() {
-                    0.0
-                } else {
-                    x.clamp(if signed { -65504.0 } else { 0.0 }, 65504.0)
-                };
+    for (batch, dst) in out[..len].as_chunks_mut::<16>().0.chunks_mut(8).enumerate() {
+        let mut blocks = [[[0.0; 3]; 16]; 8];
+        for (b, pixels) in blocks.iter_mut().take(dst.len()).enumerate() {
+            let i = batch * 8 + b;
+            for (j, p) in pixels.iter_mut().enumerate() {
+                let x = (i % bw * 4 + j % 4).min(w - 1);
+                let y = (i / bw * 4 + j / 4).min(h - 1);
+                for (c, v) in p.iter_mut().enumerate() {
+                    let off = y * image.stride + x * image.channels + c;
+                    let x = match image.data {
+                        Samples::Half(s) => bc6h::half(s[off]),
+                        Samples::Float(s) => s[off],
+                    };
+                    *v = if x.is_nan() {
+                        0.0
+                    } else {
+                        x.clamp(if signed { -65504.0 } else { 0.0 }, 65504.0)
+                    };
+                }
             }
         }
-        dst.copy_from_slice(&bc6h::encode(&pixels, signed, settings.effort));
+        // Pad the last group with a valid block; only live outputs are stored.
+        let first = blocks[0];
+        blocks[dst.len()..].fill(first);
+        bc6h::encode_batch(&blocks, signed, settings.effort, dst);
     }
     Ok(())
 }

@@ -43,6 +43,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         images.push((1, 1, vec![value; 3]));
     }
     images.push((7, 5, (0..105).map(|i| (i as f32 - 52.) / 3.).collect()));
+    // Cross row and eight-block group boundaries, including a partial group.
+    for w in [1, 4, 17, 35] {
+        let data = (0..w * 7 * 3)
+            .map(|i| {
+                let value = ((i * 37 + 11) % 1021) as f32 / 13.0;
+                if i % 5 == 0 {
+                    -value
+                } else {
+                    value
+                }
+            })
+            .collect();
+        images.push((w, 7, data));
+    }
     for format in [Format::Bc6hUf16, Format::Bc6hSf16] {
         for effort in [Effort::Fast, Effort::Balanced, Effort::Quality] {
             for (w, h, rgb) in &images {

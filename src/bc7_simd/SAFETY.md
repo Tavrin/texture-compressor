@@ -70,3 +70,9 @@ On std x86, AVX2 dispatch uses SSE4.1 with four elements for the unweighted wind
 only after an independent runtime SSE4.1 check. Weighted palettes, seeds,
 polish and estimates retain their selected backend. No new unsafe block
 or unchecked memory operation is added.
+
+HDR pair distances use f64 vectors across eight independent blocks (two per
+SSE4.1 vector, four per AVX2 vector). Runtime dispatch establishes the ISA.
+Each unaligned load covers a fixed array at offsets whose width fits eight;
+stores target equally sized local arrays. RGB operations preserve scalar order
+without fused multiply-add or horizontal reduction. Other targets use scalar.

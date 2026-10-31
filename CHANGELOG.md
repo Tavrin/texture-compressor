@@ -9,6 +9,15 @@
 - HDR perceptual objective, pinned CC0 corpus manifest, independent decoder
   conformance tests and reproducible Intel comparison/wasm identity tools.
 
+### Performance
+
+- Share BC6H candidate preparation across nested preset budgets and cache pair
+  distances across partition estimates, iterating subset masks directly.
+- Batch eight HDR blocks for SSE4.1/AVX2 pair-distance evaluation, preserving
+  scalar/wasm bytes; retain scalar endpoint fitting and selector search.
+- Replace endpoint binary-search quantisation with an exact integer inverse
+  and neighbour comparisons, checked exhaustively against the prior search.
+
 ### Changed
 
 - Reduce BC6H search cost with exact decoded-half objective tables, shared

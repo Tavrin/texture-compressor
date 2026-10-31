@@ -162,6 +162,17 @@ pub(super) fn partition_estimates<const CH: usize>(
     true
 }
 
+pub(crate) fn hdr_distances(src: &[[[f64; 8]; 16]; 3]) -> [[[f64; 16]; 16]; 8] {
+    match level() {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        // level() establishes the exact ISA; all loads/stores use fixed arrays.
+        1 => unsafe { sse41::hdr_distances(src) },
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        2 => unsafe { avx2::hdr_distances(src) },
+        _ => crate::bc6h::distance_batch(src),
+    }
+}
+
 fn detect() -> u8 {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
@@ -206,6 +217,36 @@ fn detect() -> u8 {
 ))]
 mod tests {
     use super::*;
+    #[test]
+    fn hdr_distances_match_scalar_bits() {
+        let mut state = 17u32;
+        for trial in 0..32 {
+            let src = core::array::from_fn(|_| {
+                core::array::from_fn(|_| {
+                    core::array::from_fn(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 17;
+                        state ^= state << 5;
+                        if trial == 0 {
+                            0.0
+                        } else {
+                            f64::from(state) / 1234567.0 - 1700.0
+                        }
+                    })
+                })
+            });
+            let scalar = crate::bc6h::distance_batch(&src);
+            let vector = hdr_distances(&src);
+            for (a, b) in scalar
+                .iter()
+                .flatten()
+                .flatten()
+                .zip(vector.iter().flatten().flatten())
+            {
+                assert_eq!(a.to_bits(), b.to_bits());
+            }
+        }
+    }
     #[test]
     fn kernels_match_scalar_order_and_cutoffs() {
         let selected = level();

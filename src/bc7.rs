@@ -1017,6 +1017,11 @@ pub(crate) fn encode_batch(blocks: &[[[u8; 4]; 16]; 8], out: &mut [u8], effort: 
     fast::encode_batch(blocks, out, effort);
 }
 
+#[cfg(feature = "simd")]
+pub(crate) fn hdr_distances(src: &[[[f64; 8]; 16]; 3]) -> [[[f64; 16]; 16]; 8] {
+    fast::simd::hdr_distances(src)
+}
+
 #[cfg(test)]
 #[path = "../tests/bc7_decoder.rs"]
 mod independent_decoder;

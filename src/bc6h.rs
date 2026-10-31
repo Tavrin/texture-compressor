@@ -197,26 +197,30 @@ fn half_log(h: u16) -> f64 {
     }
 }
 fn quant(x: i32, m: usize, signed: bool) -> i32 {
-    let (mut lo, mut hi) = if signed {
-        (-(1 << (PREC[m] - 1)) + 1, (1 << (PREC[m] - 1)) - 1)
+    let bits = PREC[m];
+    let (lo, hi) = if signed {
+        (-(1 << (bits - 1)) + 1, (1 << (bits - 1)) - 1)
     } else {
-        (0, (1 << PREC[m]) - 1)
+        (0, (1 << bits) - 1)
     };
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        if unquant(mid, PREC[m], signed) < x {
-            lo = mid + 1;
-        } else {
-            hi = mid;
+    if bits >= if signed { 16 } else { 15 } {
+        return x.clamp(lo, hi);
+    }
+    // Interior reconstruction is (2*q+1)*2^(15-bits), with a
+    // symmetric signed magnitude. The inverse is within one integer of
+    // this shift; explicitly compare neighbours for saturation and low ties.
+    let magnitude = x.abs() >> (16 - bits);
+    let guess = (if x < 0 { -magnitude } else { magnitude }).clamp(lo, hi);
+    let mut best = (guess - 1).max(lo);
+    let mut error = (unquant(best, bits, signed) - x).abs();
+    for q in guess..=(guess + 1).min(hi) {
+        let next = (unquant(q, bits, signed) - x).abs();
+        if next < error {
+            error = next;
+            best = q;
         }
     }
-    if lo > if signed { -(1 << (PREC[m] - 1)) + 1 } else { 0 }
-        && (unquant(lo - 1, PREC[m], signed) - x).abs() <= (unquant(lo, PREC[m], signed) - x).abs()
-    {
-        lo - 1
-    } else {
-        lo
-    }
+    best
 }
 // Reject transformed deltas without constructing a complete trial bitstream.
 fn admissible(ep: &[[i32; 3]; 4], m: usize) -> bool {
@@ -401,11 +405,49 @@ fn fit(
     }
 }
 type Candidate = ([[i32; 3]; 4], usize, usize);
-pub(crate) fn encode(pixels: &[[f32; 3]; 16], signed: bool, effort: Effort) -> [u8; 16] {
-    search(pixels, signed, effort).0
+// Eight blocks share a structure-of-arrays distance pass. Endpoint search is
+// still independent per block, retaining the scalar candidate and tie order.
+pub(crate) fn encode_batch(
+    pixels: &[[[f32; 3]; 16]; 8],
+    signed: bool,
+    effort: Effort,
+    out: &mut [[u8; 16]],
+) {
+    let source = pixels.map(|block| block.map(|p| p.map(perceptual)));
+    let soa = core::array::from_fn(|c| {
+        core::array::from_fn(|i| core::array::from_fn(|b| source[b][i][c]))
+    });
+    #[cfg(feature = "simd")]
+    let distances = crate::bc7::hdr_distances(&soa);
+    #[cfg(not(feature = "simd"))]
+    let distances = distance_batch(&soa);
+    for (b, dst) in out.iter_mut().enumerate() {
+        *dst = search(&pixels[b], &source[b], &distances[b], signed, effort).0;
+    }
 }
-fn search(pixels: &[[f32; 3]; 16], signed: bool, effort: Effort) -> ([u8; 16], Option<Candidate>) {
-    let src = pixels.map(|p| p.map(perceptual));
+pub(crate) fn distance_batch(src: &[[[f64; 8]; 16]; 3]) -> [[[f64; 16]; 16]; 8] {
+    let mut out = [[[0.0; 16]; 16]; 8];
+    for a in 0..16 {
+        for b in a..16 {
+            for (l, block) in out.iter_mut().enumerate() {
+                let mut d = 0.0;
+                for channel in src {
+                    let v = channel[a][l] - channel[b][l];
+                    d += v * v;
+                }
+                block[a][b] = d;
+            }
+        }
+    }
+    out
+}
+fn search(
+    pixels: &[[f32; 3]; 16],
+    src: &[[f64; 3]; 16],
+    distances: &[[f64; 16]; 16],
+    signed: bool,
+    effort: Effort,
+) -> ([u8; 16], Option<Candidate>) {
     let domain = pixels.map(|p| {
         p.map(|x| {
             // Invert final scaling in the integer half domain. Binary search avoids
@@ -431,64 +473,54 @@ fn search(pixels: &[[f32; 3]; 16], signed: bool, effort: Effort) -> ([u8; 16], O
     let mut best = f64::INFINITY;
     let mut result = [0; 16];
     let mut winner = None;
-    if effort != Effort::Fast {
-        let previous = search(
-            pixels,
-            signed,
-            if effort == Effort::Balanced {
-                Effort::Fast
-            } else {
-                Effort::Balanced
-            },
-        );
-        result = previous.0;
-        winner = previous.1;
-        best = 0.0;
-        for (i, p) in decode(&result, signed).iter().enumerate() {
-            for c in 0..3 {
-                let d = src[i][c] - perceptual(half(p[c]));
-                best += d * d;
-            }
-        }
-    }
     // Cache the endpoint pair and a cheap line-residual estimate once per
     // partition, independent of endpoint precision and orientation.
+    const fn masks() -> [[u16; 2]; 33] {
+        let mut out = [[0; 2]; 33];
+        let mut p = 0;
+        while p < 32 {
+            let mut i = 0;
+            while i < 16 {
+                let subset = ((partitions::PART2[p] >> (2 * i)) & 1) as usize;
+                out[p][subset] |= 1 << i;
+                i += 1;
+            }
+            p += 1;
+        }
+        out[32][0] = u16::MAX;
+        out
+    }
+    const MASKS: [[u16; 2]; 33] = masks();
     let mut pairs = [[(0, 0); 2]; 33];
     let mut order = [(0.0, 0usize); 32];
     for (p, pair) in pairs.iter_mut().enumerate() {
         let mut estimate = 0.0;
-        let mode = if p == 32 { 10 } else { 0 };
         for (subset, ends) in pair
             .iter_mut()
             .enumerate()
             .take(if p == 32 { 1 } else { 2 })
         {
             let mut dist = -1.0;
-            for a in 0..16 {
-                if pattern(mode, p, a) != subset {
-                    continue;
-                }
-                for b in a..16 {
-                    if pattern(mode, p, b) != subset {
-                        continue;
-                    }
-                    let d = (0..3)
-                        .map(|c| {
-                            let v = src[a][c] - src[b][c];
-                            v * v
-                        })
-                        .sum::<f64>();
+            let mut remaining = MASKS[p][subset];
+            while remaining != 0 {
+                let a = remaining.trailing_zeros() as usize;
+                let mut others = remaining;
+                while others != 0 {
+                    let b = others.trailing_zeros() as usize;
+                    let d = distances[a][b];
                     if d > dist {
                         dist = d;
                         *ends = (a, b);
                     }
+                    others &= others - 1;
                 }
+                remaining &= remaining - 1;
             }
             let (a, b) = *ends;
-            for i in 0..16 {
-                if pattern(mode, p, i) != subset {
-                    continue;
-                }
+            let mut remaining = MASKS[p][subset];
+            while remaining != 0 {
+                let i = remaining.trailing_zeros() as usize;
+                remaining &= remaining - 1;
                 let mut norm = 0.0;
                 let mut dot = 0.0;
                 for ((&value, &lo), &hi) in src[i].iter().zip(&src[a]).zip(&src[b]) {
@@ -508,100 +540,64 @@ fn search(pixels: &[[f32; 3]; 16], signed: bool, effort: Effort) -> ([u8; 16], O
         }
     }
     order.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-    let keep = match effort {
+    // Nested, fixed budgets reuse preparation and retain the weaker preset's
+    // fitted winner. Only newly admitted partitions need initial evaluation.
+    let stages = match effort {
         Effort::Fast => 1,
         Effort::Balanced => 2,
-        Effort::Quality => 4,
+        Effort::Quality => 3,
     };
-    for p in core::iter::once(32).chain(order.iter().take(keep).map(|x| x.1)) {
-        for m in 0..14 {
-            if (m >= 10) != (p == 32) {
-                continue;
-            }
-            let partition = if p == 32 { 0 } else { p };
-            let mut endpoints = [[0; 3]; 4];
-            for s in 0..if m < 10 { 2 } else { 1 } {
-                let pair = pairs[p][s];
-                endpoints[2 * s] = domain[pair.0].map(|x| quant(x, m, signed));
-                endpoints[2 * s + 1] = domain[pair.1].map(|x| quant(x, m, signed));
-            }
-            let p = partition;
-            // All endpoint orientations are considered before delta admission.
-            for flip in 0..if m < 10 { 4 } else { 2 } {
-                let mut ep = endpoints;
-                for s in 0..if m < 10 { 2 } else { 1 } {
-                    if flip & (1 << s) != 0 {
-                        ep.swap(2 * s, 2 * s + 1);
-                    }
-                }
-                if !admissible(&ep, m) {
+    for &(start, keep, rounds) in [(0, 1, 1), (1, 2, 1), (2, 4, 1)].iter().take(stages) {
+        for p in (if start == 0 { Some(32) } else { None })
+            .into_iter()
+            .chain(order.iter().take(keep).skip(start).map(|x| x.1))
+        {
+            for m in 0..14 {
+                if (m >= 10) != (p == 32) {
                     continue;
                 }
-                let (error, idx) = score(&ep, &src, m, p, signed);
-                if error < best {
-                    if let Some(block) = packed(&ep, m, p, &idx, signed) {
-                        best = error;
-                        result = block;
-                        winner = Some((ep, m, p));
-                    }
+                let partition = if p == 32 { 0 } else { p };
+                let mut endpoints = [[0; 3]; 4];
+                for s in 0..if m < 10 { 2 } else { 1 } {
+                    let pair = pairs[p][s];
+                    endpoints[2 * s] = domain[pair.0].map(|x| quant(x, m, signed));
+                    endpoints[2 * s + 1] = domain[pair.1].map(|x| quant(x, m, signed));
                 }
-            }
-        }
-    }
-    // Bounded coordinate refinement of the winning quantized endpoints.
-    if let Some((mut ep, m, p)) = winner {
-        fit(
-            &mut ep,
-            &src,
-            m,
-            p,
-            signed,
-            match effort {
-                Effort::Fast => 2,
-                Effort::Balanced => 3,
-                Effort::Quality => 4,
-            },
-        );
-        let (error, idx) = score(&ep, &src, m, p, signed);
-        if error < best {
-            if let Some(block) = packed(&ep, m, p, &idx, signed) {
-                best = error;
-                result = block;
-            }
-        }
-        let rounds = match effort {
-            Effort::Fast => 0,
-            Effort::Balanced => 0,
-            Effort::Quality => 0,
-        };
-        for _ in 0..rounds {
-            for e in 0..if m < 10 { 4 } else { 2 } {
-                for c in 0..3 {
-                    for step in [-16, -4, -1, 1, 4, 16] {
-                        let mut trial = ep;
-                        let value = trial[e][c] + step;
-                        let (lo, hi) = if signed {
-                            (-(1 << (PREC[m] - 1)) + 1, (1 << (PREC[m] - 1)) - 1)
-                        } else {
-                            (0, (1 << PREC[m]) - 1)
-                        };
-                        if value < lo || value > hi {
-                            continue;
+                let p = partition;
+                // All endpoint orientations are considered before delta admission.
+                for flip in 0..if m < 10 { 4 } else { 2 } {
+                    let mut ep = endpoints;
+                    for s in 0..if m < 10 { 2 } else { 1 } {
+                        if flip & (1 << s) != 0 {
+                            ep.swap(2 * s, 2 * s + 1);
                         }
-                        trial[e][c] = value;
-                        let (error, idx) = score(&trial, &src, m, p, signed);
-                        if error < best {
-                            if let Some(block) = packed(&trial, m, p, &idx, signed) {
-                                best = error;
-                                result = block;
-                                ep = trial;
-                            }
+                    }
+                    if !admissible(&ep, m) {
+                        continue;
+                    }
+                    let (error, idx) = score(&ep, src, m, p, signed);
+                    if error < best {
+                        if let Some(block) = packed(&ep, m, p, &idx, signed) {
+                            best = error;
+                            result = block;
+                            winner = Some((ep, m, p));
                         }
                     }
                 }
             }
         }
-        winner = Some((ep, m, p));
+        // Bounded coordinate refinement of the winning quantized endpoints.
+        if let Some((mut ep, m, p)) = winner {
+            fit(&mut ep, src, m, p, signed, rounds);
+            let (error, idx) = score(&ep, src, m, p, signed);
+            if error < best {
+                if let Some(block) = packed(&ep, m, p, &idx, signed) {
+                    best = error;
+                    result = block;
+                }
+            }
+            winner = Some((ep, m, p));
+        }
     }
     (result, winner)
 }
@@ -609,6 +605,43 @@ fn search(pixels: &[[f32; 3]; 16], signed: bool, effort: Effort) -> ([u8; 16], O
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn integer_quantizer_matches_binary_search_exhaustively() {
+        for signed in [false, true] {
+            for m in 0..14 {
+                for x in -65535..=65535 {
+                    assert_eq!(
+                        quant(x, m, signed),
+                        quant_binary(x, m, signed),
+                        "x={x} mode={m} signed={signed}"
+                    );
+                }
+            }
+        }
+    }
+    fn quant_binary(x: i32, m: usize, signed: bool) -> i32 {
+        let (mut lo, mut hi) = if signed {
+            (-(1 << (PREC[m] - 1)) + 1, (1 << (PREC[m] - 1)) - 1)
+        } else {
+            (0, (1 << PREC[m]) - 1)
+        };
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if unquant(mid, PREC[m], signed) < x {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo > if signed { -(1 << (PREC[m] - 1)) + 1 } else { 0 }
+            && (unquant(lo - 1, PREC[m], signed) - x).abs()
+                <= (unquant(lo, PREC[m], signed) - x).abs()
+        {
+            lo - 1
+        } else {
+            lo
+        }
+    }
     #[test]
     fn all_mode_partition_packers_are_admitted() {
         for signed in [false, true] {

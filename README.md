@@ -16,7 +16,7 @@ texture-compressor = "0.2"
 ```
 
 The default features are `std` and `simd`. Unsafe code is confined to the
-private, audited BC7 SIMD module; its safety arguments are in
+private, audited SIMD module; its safety arguments are in
 [`src/bc7_simd/SAFETY.md`](src/bc7_simd/SAFETY.md). Disabling default features
 builds an unsafe-free, scalar `no_std` library that requires `alloc`.
 The optional `parallel` feature provides encoding through the current Rayon
@@ -138,13 +138,22 @@ All fourteen modes remain candidates. Partitions are ranked by a cheap
 perceptual line-residual estimate, with endpoint pairs shared across modes.
 Fast/Balanced/Quality evaluate the best 1/2/4 partitions plus all
 single-subset modes, retain the preceding preset's result, then apply
-2/3/4 damped Gauss-Newton fitting iterations and 0/0/0 bounded
-coordinate refinement rounds. All 32 partitions remain eligible for selection.
+1/1/1 damped Gauss-Newton fitting iterations. All 32 partitions remain eligible for selection.
 Decoded binary16 objective values use an exact software-libm lookup table
 shared by native and wasm; source objective values still use software libm.
 Transformed endpoint admission precedes bitstream packing. The factor 16
-gives shadow detail weight around radiance 1/16 instead of 1. This is a scalar
-search, with no per-block heap allocation.
+gives shadow detail weight around radiance 1/16 instead of 1. Source preparation and partition estimates are shared across preset stages;
+only newly admitted partitions need initial candidate evaluation. Pair distances
+are computed once for eight blocks in structure-of-arrays form, with SSE4.1/AVX2
+runtime dispatch and a byte-identical scalar fallback on other targets.
+Endpoint search and refinement remain scalar, with no per-block heap allocation.
+Integer endpoint quantisation uses a shift and local reconstruction comparisons;
+an exhaustive test checks it against the former binary search.
+
+The pruning, bounded refinement, and block batching strategy follows the ideas
+in Intel's [ISPC Texture Compressor algorithm description, sections 2–4](https://github.com/GameTechDev/ISPCTextureCompressor/blob/master/ISPC%20Texture%20Compressor.pdf).
+That document describes BC7 and maps SIMD instances to independent blocks;
+these ideas are applied here to BC6H without copying its implementation.
 
 The normative source is [Khronos Data Format Specification 1.4, §20.2 BC6H,
 including the endpoint and block-layout tables](https://registry.khronos.org/DataFormat/specs/1.4/dataformat.1.4.html).
@@ -189,9 +198,9 @@ These are unsigned results; the independent decoder check covers both signs.
 
 | Preset / Intel preset | Log RMSE ours / Intel | Exposure PSNR ours / Intel (dB) | Encode ms ours / Intel |
 | --- | ---: | ---: | ---: |
-| Fast / fast | 0.018021 / 0.018640 | 46.96 / 46.84 | 238.38 / 9.05 |
-| Balanced / basic | 0.017718 / 0.017845 | 47.09 / 47.10 | 505.20 / 19.80 |
-| Quality / slow | 0.017493 / 0.017640 | 47.18 / 47.20 | 1157.54 / 128.53 |
+| Fast / fast | 0.018242 / 0.018640 | 46.88 / 46.84 | 150.03 / 7.49 |
+| Balanced / basic | 0.017771 / 0.017845 | 47.07 / 47.10 | 201.69 / 19.13 |
+| Quality / slow | 0.017517 / 0.017640 | 47.17 / 47.20 | 322.43 / 91.25 |
 
 The Intel log-RMSE quality target passes at all three presets.
 The encode-time target of at most twice Intel is not achieved at every preset.
