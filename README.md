@@ -134,13 +134,17 @@ Reserved modes decode to black.
 The encoder minimizes `Σ(T(source) - T(decoded))²` over RGB and texels,
 where `T(x) = sign(x) * log2(1 + 16 * abs(x))`. The software `libm` implementation
 and f64 accumulation keep this objective consistent across native and wasm.
-All presets search all fourteen modes and
-thirty-two partitions, including transformed endpoint admission and anchor
-constraints. Each preset retains the preceding preset's result, then applies
-damped Gauss-Newton fitting in the decoded objective and bounded endpoint
-coordinate refinement. Fast/Balanced/Quality allow 8/12/16 fitting iterations and 1/2/3 coordinate
-refinement rounds. The factor 16 gives shadow detail weight around radiance
-1/16 instead of 1. This is a scalar search.
+All fourteen modes remain candidates. Partitions are ranked by a cheap
+perceptual line-residual estimate, with endpoint pairs shared across modes.
+Fast/Balanced/Quality evaluate the best 1/2/4 partitions plus all
+single-subset modes, retain the preceding preset's result, then apply
+2/3/4 damped Gauss-Newton fitting iterations and 0/0/0 bounded
+coordinate refinement rounds. All 32 partitions remain eligible for selection.
+Decoded binary16 objective values use an exact software-libm lookup table
+shared by native and wasm; source objective values still use software libm.
+Transformed endpoint admission precedes bitstream packing. The factor 16
+gives shadow detail weight around radiance 1/16 instead of 1. This is a scalar
+search, with no per-block heap allocation.
 
 The normative source is [Khronos Data Format Specification 1.4, §20.2 BC6H,
 including the endpoint and block-layout tables](https://registry.khronos.org/DataFormat/specs/1.4/dataformat.1.4.html).
@@ -185,10 +189,11 @@ These are unsigned results; the independent decoder check covers both signs.
 
 | Preset / Intel preset | Log RMSE ours / Intel | Exposure PSNR ours / Intel (dB) | Encode ms ours / Intel |
 | --- | ---: | ---: | ---: |
-| Fast / fast | 0.017004 / 0.018640 | 47.37 / 46.84 | 4544.07 / 6.25 |
-| Balanced / basic | 0.016934 / 0.017845 | 47.40 / 47.10 | 9036.64 / 16.00 |
-| Quality / slow | 0.016932 / 0.017640 | 47.41 / 47.20 | 13780.91 / 78.49 |
+| Fast / fast | 0.018021 / 0.018640 | 46.96 / 46.84 | 238.38 / 9.05 |
+| Balanced / basic | 0.017718 / 0.017845 | 47.09 / 47.10 | 505.20 / 19.80 |
+| Quality / slow | 0.017493 / 0.017640 | 47.18 / 47.20 | 1157.54 / 128.53 |
 
-The Intel quality target passes on both aggregate metrics at all three presets.
-No encode-time target is claimed. Full-size images, other HDR content, signed
+The Intel log-RMSE quality target passes at all three presets.
+The encode-time target of at most twice Intel is not achieved at every preset.
+These paired timings were collected on a shared host and retain scheduling noise. Full-size images, other HDR content, signed
 quality against Intel, and hardware GPU decoding are not qualified by this run.

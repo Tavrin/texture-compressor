@@ -11,6 +11,8 @@
 
 ### Changed
 
+- Reduce BC6H search cost with exact decoded-half objective tables, shared
+  endpoint estimates, ranked partitions, and early delta admission.
 - `Format`, `Effort`, and `Error` are now `#[non_exhaustive]`; downstream
   matches need wildcard arms. `Format` gains `Bc6hUf16` and `Bc6hSf16`.
 - Version increases to 0.2.0 for these public enum changes.

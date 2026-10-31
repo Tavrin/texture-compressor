@@ -39,7 +39,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (Effort::Balanced, intel_tex_2::bc6h::basic_settings()),
         (Effort::Quality, intel_tex_2::bc6h::slow_settings()),
     ] {
+        if let Ok(preset) = std::env::var("BC6H_PRESET") {
+            if !format!("{effort:?}").eq_ignore_ascii_case(&preset) {
+                continue;
+            }
+        }
         let settings = Settings::new(Format::Bc6hUf16, effort);
+        if std::env::var_os("BC6H_PROFILE").is_some() {
+            for rgb in &source {
+                std::hint::black_box(encode_hdr(
+                    HdrImageView::rgb_f32(rgb, 64, 64, 192)?,
+                    &settings,
+                )?);
+            }
+            continue;
+        }
         let mut times = [Vec::new(), Vec::new()];
         let mut outputs = [Vec::new(), Vec::new()];
         // Untimed warmup for each implementation, on the same first image.

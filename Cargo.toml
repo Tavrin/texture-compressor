@@ -27,6 +27,9 @@ rayon = { version = "1.11", optional = true }
 
 libm = "0.2"
 
+[build-dependencies]
+libm = "0.2"
+
 [dev-dependencies]
 bcdec_rs = "0.2"
 
