@@ -48,7 +48,24 @@ pub enum AlphaPolicy {
         threshold: u8,
     },
 }
-/// Format, search preset and alpha policy used by an encode operation.
+/// Endpoint objective for unsigned BC4 and BC5 channels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Bc45Fit {
+    /// The existing preset's squared-error fit (the default).
+    #[default]
+    SquaredError,
+    /// Fit with the range fit's block peak-error bound.
+    ///
+    /// Starts with nearest selectors for the block's maximum/minimum endpoints.
+    /// Fast and Balanced keep these endpoints; Quality searches for lower
+    /// squared error without increasing that fit's maximum absolute byte error.
+    /// BC5 applies the bound independently to R and G.
+    /// BC5 also rejects refinements whose worst reconstructed positive-Z normal
+    /// score is worse than the range fit's, using an integer approximation.
+    /// These bounds are relative to that fit, not to every other encoder.
+    PeakBounded,
+}
+/// Format, search preset and fitting policies used by an encode operation.
 #[derive(Clone, Copy, Debug)]
 pub struct Settings {
     /// Output block format.
@@ -57,6 +74,8 @@ pub struct Settings {
     pub effort: Effort,
     /// Alpha policy; defaults to opaque BC1 and preserved BC3/BC7 alpha.
     pub alpha: AlphaPolicy,
+    /// BC4/BC5 endpoint objective; ignored by BC1, BC3 and BC7.
+    pub bc45_fit: Bc45Fit,
 }
 impl Settings {
     /// Create settings with [`AlphaPolicy::Opaque`].
@@ -65,6 +84,7 @@ impl Settings {
             format,
             effort,
             alpha: AlphaPolicy::Opaque,
+            bc45_fit: Bc45Fit::SquaredError,
         }
     }
 }
@@ -329,7 +349,12 @@ fn encode_row(image: ImageView<'_>, settings: &Settings, by: usize, row: &mut [u
             Format::Bc1 => {
                 dst.copy_from_slice(&bc1::encode(&pixels, settings.effort, settings.alpha))
             }
-            Format::Bc4 => dst.copy_from_slice(&bc4::encode(&pixels, settings.effort, 0)),
+            Format::Bc4 => dst.copy_from_slice(&bc4::encode_with_fit(
+                &pixels,
+                settings.effort,
+                0,
+                settings.bc45_fit,
+            )),
             Format::Bc3 => {
                 dst[..8].copy_from_slice(&bc4::encode(&pixels, settings.effort, 3));
                 let color = if settings.effort == Effort::Balanced {
@@ -339,10 +364,11 @@ fn encode_row(image: ImageView<'_>, settings: &Settings, by: usize, row: &mut [u
                 };
                 dst[8..].copy_from_slice(&color);
             }
-            Format::Bc5 => {
-                dst[..8].copy_from_slice(&bc4::encode(&pixels, settings.effort, 0));
-                dst[8..].copy_from_slice(&bc4::encode(&pixels, settings.effort, 1));
-            }
+            Format::Bc5 => dst.copy_from_slice(&bc4::encode_pair(
+                &pixels,
+                settings.effort,
+                settings.bc45_fit,
+            )),
             Format::Bc7 => dst.copy_from_slice(&bc7::encode(&pixels, settings.effort)),
         }
     }

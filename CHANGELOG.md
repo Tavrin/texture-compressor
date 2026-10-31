@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Add opt-in `Settings::bc45_fit = Bc45Fit::PeakBounded` for BC4/BC5.
+  Fast and Balanced use a direct range fit; Quality retains bounded refinement.
+  Refinement bounds each block's channel peak error by its range fit while
+  retaining or lowering its squared error. BC5 also checks its worst positive-Z
+  normal score against the range fit. Existing presets keep their bytes.
+  Struct literals for `Settings` need the new field.
+
 ## [0.1.1] - 2026-10-30
 
 - `Error` implements `Display`, and `std::error::Error` with the `std`
