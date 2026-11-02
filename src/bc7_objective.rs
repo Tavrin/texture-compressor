@@ -6,6 +6,8 @@ pub(super) struct Objective {
     pub visible: u16,
     pub alpha: u8,
     pub alpha_weight: u8,
+    /// Weight of each visible colour channel; invisible colour weighs zero.
+    pub colour_weight: u8,
 }
 
 impl Objective {
@@ -13,16 +15,17 @@ impl Objective {
         if c == usize::from(self.alpha) {
             i32::from(self.alpha_weight)
         } else {
-            i32::from(self.visible >> i & 1)
+            i32::from(self.visible >> i & 1) * i32::from(self.colour_weight)
         }
     }
 }
 
-// The bounded objectives use only weights 0, 1 and 4; avoid libm in no_std.
+// The bounded objectives use only weights 0, 1, 2 and 4; avoid libm in no_std.
 fn root_weight(w: i32) -> f32 {
     match w {
         0 => 0.0,
         1 => 1.0,
+        2 => core::f32::consts::SQRT_2,
         4 => 2.0,
         _ => unreachable!(),
     }
@@ -125,6 +128,11 @@ fn moments<const C0: usize, const C1: usize>(px: &Block, reps: &Reps) -> ([f32; 
 
 pub(super) fn estimate<const C0: usize, const C1: usize>(px: &Block, reps: &Reps) -> (f32, f32) {
     let (_, cov) = moments::<C0, C1>(px, reps);
+    principal::<C0, C1>(&cov)
+}
+
+// (Residual off the principal axis, principal variance) of a covariance.
+fn principal<const C0: usize, const C1: usize>(cov: &[[f32; 4]; 4]) -> (f32, f32) {
     let mut trace = 0.0;
     let mut top = C0;
     for c in C0..C1 {
@@ -148,6 +156,149 @@ pub(super) fn estimate<const C0: usize, const C1: usize>(px: &Block, reps: &Reps
     }
     let lambda = (wcw / ww).min(trace);
     (trace - lambda, lambda)
+}
+
+// Integer sums of one texel set, additive over texels: visible count, visible
+// R, G, B, A sums, the six visible colour products (rr rg rb gg gb bb), the
+// three visible colour-alpha products, then the count, alpha sum and alpha
+// square of all texels.
+type Sums = [i32; 17];
+
+// The observed covariance of a texel set from its sums, as `moments` defines
+// it: colour moments over visible texels, alpha over all texels, each channel
+// centred on its own mean and scaled by the root of its weight.
+fn sums_covariance(s: &Sums, o: Objective) -> [[f32; 4]; 4] {
+    let mut cov = [[0f32; 4]; 4];
+    let cw = root_weight(i32::from(o.colour_weight));
+    let aw = root_weight(i32::from(o.alpha_weight));
+    let nv = i64::from(s[0]);
+    if nv > 0 {
+        let mut k = 5;
+        for c in 0..3 {
+            for e in c..3 {
+                let v = (nv * i64::from(s[k]) - i64::from(s[1 + c]) * i64::from(s[1 + e])) as f32
+                    / nv as f32
+                    * cw
+                    * cw;
+                cov[c][e] = v;
+                cov[e][c] = v;
+                k += 1;
+            }
+        }
+        for c in 0..3 {
+            let v = (nv * i64::from(s[11 + c]) - i64::from(s[1 + c]) * i64::from(s[4])) as f32
+                / nv as f32
+                * cw
+                * aw;
+            cov[c][3] = v;
+            cov[3][c] = v;
+        }
+    }
+    let nt = i64::from(s[14]);
+    if nt > 0 {
+        cov[3][3] = (nt * i64::from(s[16]) - i64::from(s[15]) * i64::from(s[15])) as f32
+            / nt as f32
+            * aw
+            * aw;
+    }
+    cov
+}
+
+/// Row lookup tables of texel sums for a block with alpha in channel 3: the
+/// sums of any texel subset are four lookups, so partition estimates need no
+/// per-partition moment passes.
+pub(super) struct SumTable {
+    rows: [[Sums; 16]; 4],
+    o: Objective,
+}
+
+impl SumTable {
+    pub(super) fn new(px: &Block, o: Objective) -> Self {
+        debug_assert_eq!(o.alpha, 3);
+        let mut rows = [[[0i32; 17]; 16]; 4];
+        for (row, table) in rows.iter_mut().enumerate() {
+            for mask in 1usize..16 {
+                let i = row * 4 + mask.trailing_zeros() as usize;
+                let p = px[i].map(i32::from);
+                let mut s = table[mask & (mask - 1)];
+                if o.visible >> i & 1 == 1 {
+                    s[0] += 1;
+                    for c in 0..4 {
+                        s[1 + c] += p[c];
+                    }
+                    let mut k = 5;
+                    for c in 0..3 {
+                        for e in c..3 {
+                            s[k] += p[c] * p[e];
+                            k += 1;
+                        }
+                    }
+                    for c in 0..3 {
+                        s[11 + c] += p[c] * p[3];
+                    }
+                }
+                s[14] += 1;
+                s[15] += p[3];
+                s[16] += p[3] * p[3];
+                table[mask] = s;
+            }
+        }
+        Self { rows, o }
+    }
+
+    fn sums(&self, mask: u16) -> Sums {
+        let mut s = [0i32; 17];
+        for (row, table) in self.rows.iter().enumerate() {
+            let part = &table[usize::from((mask >> (4 * row)) & 15)];
+            for k in 0..17 {
+                s[k] += part[k];
+            }
+        }
+        s
+    }
+
+    /// Estimates of all 64 two-subset partitions for the RGB modes (`[0]`)
+    /// and mode 7 (`[1]`).
+    pub(super) fn rankings(&self) -> [[(f32, f32); 64]; 2] {
+        let total = self.sums(0xffff);
+        let mut out = [[(0f32, 0f32); 64]; 2];
+        for p in 0..64 {
+            let one = self.sums(MASKS2[p][0]);
+            let mut zero = total;
+            for k in 0..17 {
+                zero[k] -= one[k];
+            }
+            for s in [zero, one] {
+                let cov = sums_covariance(&s, self.o);
+                let rgb = principal::<0, 3>(&cov);
+                let rgba = principal::<0, 4>(&cov);
+                out[0][p].0 += rgb.0;
+                out[0][p].1 += rgb.1;
+                out[1][p].0 += rgba.0;
+                out[1][p].1 += rgba.1;
+            }
+        }
+        out
+    }
+
+    /// RGB estimates of the first `count` three-subset partitions given by
+    /// their subset masks; the rest stay unranked.
+    pub(super) fn rankings3(
+        &self,
+        count: usize,
+        masks: impl Fn(usize) -> [u16; 3],
+    ) -> [(f32, f32); 64] {
+        let mut out = [(f32::MAX, 0f32); 64];
+        for (p, slot) in out.iter_mut().enumerate().take(count) {
+            *slot = (0.0, 0.0);
+            for mask in masks(p) {
+                let e = principal::<0, 3>(&sums_covariance(&self.sums(mask), self.o));
+                slot.0 += e.0;
+                slot.1 += e.1;
+            }
+        }
+        out
+    }
 }
 
 pub(super) fn targets<const C0: usize, const C1: usize>(px: &Block, reps: &Reps) -> Pair {
@@ -219,7 +370,7 @@ pub(super) fn targets<const C0: usize, const C1: usize>(px: &Block, reps: &Reps)
             / root_weight(if c == usize::from(o.alpha) {
                 i32::from(o.alpha_weight)
             } else {
-                1
+                i32::from(o.colour_weight).max(1)
             });
         t[0][c] = (mean[c] + lo * dir + 0.5).clamp(0.0, 255.0) as i32;
         t[1][c] = (mean[c] + hi * dir + 0.5).clamp(0.0, 255.0) as i32;
@@ -407,7 +558,7 @@ impl Reps {
         }
     }
 }
-use super::search::{dual_layout, parity_of, Search, P0, P2};
+use super::search::{dual_layout, parity_of, Search, P0};
 pub(super) use targets as axis_targets;
 
 pub(super) fn fit<const C0: usize, const C1: usize>(
@@ -445,11 +596,14 @@ pub(super) fn improve<const C0: usize, const C1: usize>(
     iters: usize,
     rounds: usize,
     force_p1: bool,
-) {
+) -> u32 {
+    // Passes performed, counted as in the unweighted `improve`.
+    let mut passes = 0;
     for _ in 0..iters {
         if best.err == 0 {
             break;
         }
+        passes += 1;
         let Some(t) = least_squares::<C0, C1>(px, reps, &best.idx, lv) else {
             break;
         };
@@ -457,6 +611,7 @@ pub(super) fn improve<const C0: usize, const C1: usize>(
         if d == best.d {
             break;
         }
+        passes += 1;
         let mut idx = best.idx;
         let err = select::<C0, C1>(px, reps, &d, lv, &mut idx, best.err);
         if err >= best.err {
@@ -465,10 +620,15 @@ pub(super) fn improve<const C0: usize, const C1: usize>(
         *best = Fit { err, d, idx };
     }
     for _ in 0..rounds {
-        if best.err == 0 || !polish::<C0, C1>(px, reps, best, prec, lv) {
+        if best.err == 0 {
+            break;
+        }
+        passes += 3;
+        if !polish::<C0, C1>(px, reps, best, prec, lv) {
             break;
         }
     }
+    passes
 }
 
 pub(super) fn parity<const C0: usize, const C1: usize>(
@@ -478,34 +638,32 @@ pub(super) fn parity<const C0: usize, const C1: usize>(
     prec: Prec,
     lv: &Levels,
     iters: usize,
-) {
-    let combos: &[[usize; 2]] = match prec.pbit {
-        PBit::None => return,
-        PBit::Unique => &[[0, 0], [0, 1], [1, 0], [1, 1]],
-        PBit::Shared => &[[0, 0], [1, 1]],
-    };
-    if f.err == 0 {
-        return;
+    tries: usize,
+) -> u32 {
+    // Passes performed: each least-squares solve and selector pass is one.
+    if prec.pbit == PBit::None || f.err == 0 || tries == 0 {
+        return 0;
     }
+    let mut passes = 1;
     let Some(t) = least_squares::<C0, C1>(px, reps, &f.idx, lv) else {
-        return;
+        return passes;
     };
     let current = parity_of::<C0>(&f.d, prec);
-    for &p in combos {
-        if p == current {
-            continue;
-        }
+    let (ranked, len) = super::search::ranked_parities::<C0, C1>(&t, prec, current);
+    for &p in &ranked[..len.min(tries)] {
         let d = quantize_with::<C0, C1>(&t, prec, p);
         let mut g = Fit {
             err: 0,
             d,
             idx: f.idx,
         };
+        passes += 1;
         g.err = select::<C0, C1>(px, reps, &d, lv, &mut g.idx, u32::MAX);
         for _ in 0..iters {
             if g.err == 0 {
                 break;
             }
+            passes += 1;
             let Some(t) = least_squares::<C0, C1>(px, reps, &g.idx, lv) else {
                 break;
             };
@@ -513,6 +671,7 @@ pub(super) fn parity<const C0: usize, const C1: usize>(
             if d == g.d {
                 break;
             }
+            passes += 1;
             let mut idx = g.idx;
             let err = select::<C0, C1>(px, reps, &d, lv, &mut idx, g.err);
             if err >= g.err {
@@ -524,6 +683,7 @@ pub(super) fn parity<const C0: usize, const C1: usize>(
             *f = g;
         }
     }
+    passes
 }
 
 pub(super) fn dual_fit(
@@ -559,15 +719,15 @@ pub(super) fn refine_dual(
     alpha: &mut Fit,
     cfg: &Search,
     compact: bool,
-) {
+) -> u32 {
     let (cp, cl, ap, al) = dual_layout(mode, sel);
     let (iters, rounds) = (cfg.refine_iters, cfg.refine_rounds);
-    if compact {
-        improve::<0, 2>(px, reps, color, cp, cl, iters, rounds, false);
+    let colour = if compact {
+        improve::<0, 2>(px, reps, color, cp, cl, iters, rounds, false)
     } else {
-        improve::<0, 3>(px, reps, color, cp, cl, iters, rounds, false);
-    }
-    improve::<3, 4>(px, reps, alpha, ap, al, iters, rounds, false);
+        improve::<0, 3>(px, reps, color, cp, cl, iters, rounds, false)
+    };
+    colour + improve::<3, 4>(px, reps, alpha, ap, al, iters, rounds, false)
 }
 
 // Endpoints of one subset from its axis targets, then `iters` least-squares
@@ -630,31 +790,32 @@ pub(super) fn refine_subset(
     f: &mut Fit,
     opaque: bool,
     cfg: &Search,
-) {
-    let (iters, rounds) = (cfg.refine_iters, cfg.refine_rounds);
+) -> u32 {
+    let (iters, rounds, tries) = (cfg.refine_iters, cfg.refine_rounds, cfg.pbit_tries);
     match mode {
         0 => {
-            parity::<0, 3>(px, reps, f, P0, &L3, iters);
-            improve::<0, 3>(px, reps, f, P0, &L3, iters, rounds, false);
+            parity::<0, 3>(px, reps, f, P0, &L3, iters, tries)
+                + improve::<0, 3>(px, reps, f, P0, &L3, iters, rounds, false)
         }
-        2 => improve::<0, 3>(px, reps, f, P2, &L2, iters, rounds, false),
         1 => {
-            parity::<0, 3>(px, reps, f, P1, &L3, iters);
-            improve::<0, 3>(px, reps, f, P1, &L3, iters, rounds, false);
+            parity::<0, 3>(px, reps, f, P1, &L3, iters, tries)
+                + improve::<0, 3>(px, reps, f, P1, &L3, iters, rounds, false)
         }
         3 => {
-            parity::<0, 3>(px, reps, f, P3, &L2, iters);
-            improve::<0, 3>(px, reps, f, P3, &L2, iters, rounds, false);
+            parity::<0, 3>(px, reps, f, P3, &L2, iters, tries)
+                + improve::<0, 3>(px, reps, f, P3, &L2, iters, rounds, false)
         }
         _ => {
+            let mut passes = 0;
             if !opaque {
-                parity::<0, 4>(px, reps, f, P7, &L2, iters);
+                passes += parity::<0, 4>(px, reps, f, P7, &L2, iters, tries);
             }
-            improve::<0, 4>(px, reps, f, P7, &L2, iters, rounds, opaque);
+            passes += improve::<0, 4>(px, reps, f, P7, &L2, iters, rounds, opaque);
             if opaque {
                 f.d[0][3] = 255;
                 f.d[1][3] = 255;
             }
+            passes
         }
     }
 }

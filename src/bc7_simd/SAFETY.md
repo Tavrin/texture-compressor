@@ -24,8 +24,14 @@ borrows, and pointers are neither offset nor retained. Arithmetic intrinsics
 use values only inside functions with the corresponding target feature.
 There is no unchecked indexing, transmute, union, raw-pointer arithmetic,
 uninitialized memory, FFI, allocator manipulation or unsafe synchronization.
-Inventory: 19 source unsafe blocks, all in this directory (16 array memory
+Inventory: 27 source unsafe blocks, all in this directory (24 array memory
 blocks, 3 checked dispatch branches). The kernel macro itself has none.
+The selector tables add two loads per backend: `bytes` reads one
+`&[u8; 16]` (16 bytes); x86 and Wasm `quad` read one `&[[u8; 4]; 4]`
+(16 bytes) obtained from the block by `as_chunks::<4>` (bounds-checked
+indexing of its four chunks), and NEON `planes` reads the whole `&Block`
+(`[[u8; 4]; 16]`, exactly 64 bytes) with a de-interleaving `vld4q_u8`. Each
+reads exactly the size of its fixed-array borrow, unaligned, with no offset.
 
 Search control, candidate ordering and packing remain scalar. Mode-6 seeds (moments/PCA, palette/error and one LS refinement)
 batch 4/8 blocks in texel/channel/block SoA; short image batches stage zeroed
@@ -34,10 +40,8 @@ whether a seed is consumed. Seed selector evaluation visits all 16 texels;
 integer SSE equals multiplicity-weighted representatives exactly. The LS
 step uses the original distinct representatives and scalar i64/f64 arithmetic.
 Its full-error evaluation is equivalent to scalar cutoffs: a cutoff can only
-reject a candidate, and every improving candidate completes all selectors. Palette errors vectorize independent candidate
-entries, then visit valid selectors in ascending order with strict `<` ties.
-Cutoffs accumulate representatives in the original order, writing exactly
-the same partial selector prefix. Polish vectorizes the five endpoint
+reject a candidate, and every improving candidate completes all selectors.
+Selectors are described below. Polish vectorizes the five endpoint
 choices and preserves candidate order, validity checks and fixed-error
 fallback. Partition estimates batch independent subsets in SoA.
 
@@ -54,22 +58,35 @@ Finite differential tests establish the explicitly recorded identity matrix,
 not a proof over every possible block. AArch64 execution needs a native or
 emulated runner; cross-target linting alone does not establish parity there.
 
+Selectors put one representative in each element, 4 or 8 at a time.
+Byte tables hold the texel channels (from the block), the representative
+pixel indices (`Reps::ids`), the palette of each channel and the midpoint
+thresholds; per-element reads are byte shuffles whose index bytes other than
+the lowest are 0x80 (read as zero). Palette entries are 0..=255, so the
+saturating packs are exact. Unweighted lanes reproduce the scalar
+projection (i32 dot product, f32 multiply then add, truncation, clamp to
+0..=64) and the scalar `nearest` entry: a guess g within one of it,
+corrected by the two thresholds around g, which a compile-time assertion
+checks for every k and each of the three weight tables. Candidates are
+the same window in ascending order with strict `<`; a candidate past the
+window may read a wrapped table entry, and the window bound masks it
+before it is compared. Weighted lanes scan the full palette in ascending
+order with strict `<`, colour channels sharing one weight per texel. Only
+the error accumulation is scalar: representatives in the original order,
+the same count product, cutoff and partial selector prefix. Lanes past
+`len` are computed and discarded.
+
 The selector and polish kernels specialize observation weights at entry.
-Unweighted selection retains the same projected palette window and strict
-ascending ties. Unweighted polish is selected only without an objective and
+Unweighted polish is selected only without an objective and
 without duplicate representatives (`expand == false`); every multiplicity is
 then one. All other cases retain the original weight multiplication. This
 removes multiplications by one without changing bounds, traversal or sums.
 The array helpers and feature-checked unsafe dispatch are unchanged.
 
-Palette storage specializes to N=4/8/16, with N+lane_width initialized
-entries per channel. The latest projected-window base is N-2 and the last
-load ends at N-2+lane_width, within that padding. Weighted full-palette
-loads obey the same bound. Extra slots are never eligible for selection.
-On std x86, AVX2 dispatch uses SSE4.1 with four elements for the unweighted window
-only after an independent runtime SSE4.1 check. Weighted palettes, seeds,
-polish and estimates retain their selected backend. No new unsafe block
-or unchecked memory operation is added.
+Palette tables specialize to N=4/8/16 with 16 entries; entries at and
+after N are never eligible for selection. Selectors run on the selected
+backend (AVX2 uses eight lanes; the earlier SSE4.1 detour for unweighted
+windows is removed).
 
 HDR pair distances use f64 vectors across eight independent blocks (two per
 SSE4.1 vector, four per AVX2 vector). Runtime dispatch establishes the ISA.

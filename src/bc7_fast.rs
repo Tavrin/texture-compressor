@@ -156,10 +156,13 @@ const fn quant_tables() -> [[[u8; 256]; 3]; 9] {
 static QUANT: [[[u8; 256]; 3]; 9] = quant_tables();
 
 // The pixels a fit scores: one representative pixel per distinct colour with
-// its multiplicity, and each pixel's representative.
+// its multiplicity, and each pixel's representative. Pixel indices and
+// counts are separate byte arrays so vector selectors can load them whole;
+// entries at and after `len` are unused.
 #[derive(Clone, Copy)]
 struct Reps {
-    list: [(u8, u8); 16],
+    ids: [u8; 16],
+    counts: [u8; 16],
     len: usize,
     of: [u8; 16],
     expand: bool,
@@ -169,24 +172,26 @@ impl Reps {
     // Identical RGBA pixels share one representative.
     fn distinct(px: &Block) -> Self {
         let mut r = Reps {
-            list: [(0, 0); 16],
+            ids: [0; 16],
+            counts: [0; 16],
             len: 0,
             of: [0; 16],
             expand: false,
         };
         let keys = px.map(u32::from_le_bytes);
         for (i, &key) in keys.iter().enumerate() {
-            match r.list[..r.len]
-                .iter_mut()
-                .find(|(j, _)| keys[usize::from(*j)] == key)
+            match r.ids[..r.len]
+                .iter()
+                .position(|&j| keys[usize::from(j)] == key)
             {
                 Some(slot) => {
                     r.expand = true;
-                    slot.1 += 1;
-                    r.of[i] = slot.0;
+                    r.counts[slot] += 1;
+                    r.of[i] = r.ids[slot];
                 }
                 None => {
-                    r.list[r.len] = (i as u8, 1);
+                    r.ids[r.len] = i as u8;
+                    r.counts[r.len] = 1;
                     r.of[i] = i as u8;
                     r.len += 1;
                 }
@@ -198,14 +203,16 @@ impl Reps {
     // Every pixel of the subset is its own representative.
     fn subset(mask: u16) -> Self {
         let mut r = Reps {
-            list: [(0, 0); 16],
+            ids: [0; 16],
+            counts: [0; 16],
             len: 0,
             of: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
             expand: false,
         };
         let mut m = mask;
         while m != 0 {
-            r.list[r.len] = (m.trailing_zeros() as u8, 1);
+            r.ids[r.len] = m.trailing_zeros() as u8;
+            r.counts[r.len] = 1;
             r.len += 1;
             m &= m - 1;
         }
@@ -228,10 +235,11 @@ impl Reps {
             m &= m - 1;
         }
         r.len = 0;
-        for &(i, _) in &self.list[..self.len] {
+        for &i in &self.ids[..self.len] {
             let count = counts[usize::from(i)];
             if count != 0 {
-                r.list[r.len] = (i, count);
+                r.ids[r.len] = i;
+                r.counts[r.len] = count;
                 r.len += 1;
             }
         }
@@ -239,9 +247,10 @@ impl Reps {
     }
 
     fn iter(&self) -> impl Iterator<Item = (usize, i32)> + '_ {
-        self.list[..self.len]
+        self.ids[..self.len]
             .iter()
-            .map(|&(i, n)| (usize::from(i), i32::from(n)))
+            .zip(&self.counts[..self.len])
+            .map(|(&i, &n)| (usize::from(i), i32::from(n)))
     }
 }
 
@@ -692,7 +701,8 @@ fn fit<const C0: usize, const C1: usize>(
 }
 
 // Up to `iters` least-squares passes while the error falls, then up to
-// `rounds` polish passes.
+// `rounds` polish passes. Returns the passes performed, counting a
+// least-squares solve or a selector pass as one and a polish round as three.
 #[allow(
     clippy::too_many_arguments,
     reason = "the fit parameters are independent knobs shared by every mode"
@@ -706,11 +716,13 @@ fn improve<const C0: usize, const C1: usize>(
     iters: usize,
     rounds: usize,
     force_p1: bool,
-) {
+) -> u32 {
+    let mut passes = 0;
     for _ in 0..iters {
         if best.err == 0 {
             break;
         }
+        passes += 1;
         let Some(t) = least_squares::<C0, C1>(px, reps, &best.idx, lv) else {
             break;
         };
@@ -718,6 +730,7 @@ fn improve<const C0: usize, const C1: usize>(
         if d == best.d {
             break;
         }
+        passes += 1;
         let mut idx = best.idx;
         let err = select::<C0, C1>(px, reps, &d, lv, &mut idx, best.err);
         if err >= best.err {
@@ -726,10 +739,15 @@ fn improve<const C0: usize, const C1: usize>(
         *best = Fit { err, d, idx };
     }
     for _ in 0..rounds {
-        if best.err == 0 || !polish::<C0, C1>(px, reps, best, prec, lv) {
+        if best.err == 0 {
+            break;
+        }
+        passes += 3;
+        if !polish::<C0, C1>(px, reps, best, prec, lv) {
             break;
         }
     }
+    passes
 }
 
 // Flip a subset so its anchor selector has a clear high bit.
@@ -878,6 +896,12 @@ const fn moment_len(ch: usize) -> usize {
 // Per-row prefix moments for every 4-pixel subset of each row.
 fn moment_rows<const CH: usize>(px: &Block) -> [[Moments; 16]; 4] {
     let mut lut = [[Moments::default(); 16]; 4];
+    fill_moment_rows::<CH>(px, &mut lut);
+    lut
+}
+
+// `moment_rows` in place; every entry must start at zero.
+fn fill_moment_rows<const CH: usize>(px: &Block, lut: &mut [[Moments; 16]; 4]) {
     for (row, table) in lut.iter_mut().enumerate() {
         for mask in 1usize..16 {
             let p = &px[row * 4 + mask.trailing_zeros() as usize];
@@ -895,7 +919,6 @@ fn moment_rows<const CH: usize>(px: &Block) -> [[Moments; 16]; 4] {
             table[mask] = m;
         }
     }
-    lut
 }
 
 // Off-axis residual and principal variance of one subset, in SSE units.

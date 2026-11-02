@@ -15,60 +15,65 @@ use super::super::tables::{ANCHOR3A, ANCHOR3B};
 use super::super::MASKS3;
 use super::*;
 
-// Keep the row moments used for ranking, so fitted subsets reuse those sums.
+// Moments of both subsets of every two-subset partition, kept so fitted
+// subsets reuse the sums that ranked them. Lanes 64.. repeat partition 63
+// so that SIMD batches of four or eight never leave the arrays.
 struct Partitions {
     est: [(f32, f32); 64],
     rows: [[Moments; 16]; 4],
-    total: Moments,
+    zero: [Moments; PARTITION_LANES],
+    one: [Moments; PARTITION_LANES],
 }
+
+/// Two-subset partitions plus padding up to a whole SIMD batch.
+pub(super) const PARTITION_LANES: usize = 68;
 
 impl Partitions {
     fn new<const CH: usize>(px: &Block) -> Self {
-        let rows = moment_rows::<CH>(px);
         let len = moment_len(CH);
+        let mut data = Self {
+            est: [(0.0, 0.0); 64],
+            rows: [[Moments::default(); 16]; 4],
+            zero: [Moments::default(); PARTITION_LANES],
+            one: [Moments::default(); PARTITION_LANES],
+        };
+        fill_moment_rows::<CH>(px, &mut data.rows);
         let mut total = Moments::default();
-        for row in &rows {
+        for row in &data.rows {
             for k in 0..len {
                 total.m[k] += row[15].m[k];
             }
         }
-        let mut data = Self {
-            est: [(0.0, 0.0); 64],
-            rows,
-            total,
-        };
-        #[cfg(feature = "simd")]
-        {
-            let mut est = [(0.0, 0.0); 64];
-            if simd::partition_estimates::<CH>(&mut est, |p| data.subsets::<CH>(p)) {
-                data.est = est;
-                return data;
+        // Integer sums: the order of the additions cannot change a moment.
+        for p in 0..PARTITION_LANES {
+            let mask = MASKS2[p.min(63)][0];
+            let mut one = data.rows[0][usize::from(mask & 15)];
+            for row in 1..4 {
+                let part = &data.rows[row][usize::from((mask >> (4 * row)) & 15)];
+                for k in 0..len {
+                    one.m[k] += part.m[k];
+                }
             }
+            let zero = &mut data.zero[p];
+            for k in 0..len {
+                zero.m[k] = total.m[k] - one.m[k];
+            }
+            data.one[p] = one;
+        }
+        #[cfg(feature = "simd")]
+        if simd::partition_estimates::<CH>(&mut data.est, &data.zero, &data.one) {
+            return data;
         }
         for p in 0..64 {
-            let [zero, one] = data.subsets::<CH>(p);
-            let a = subset_estimate::<CH>(&zero);
-            let b = subset_estimate::<CH>(&one);
+            let a = subset_estimate::<CH>(&data.zero[p]);
+            let b = subset_estimate::<CH>(&data.one[p]);
             data.est[p] = (a.0 + b.0, a.1 + b.1);
         }
         data
     }
 
     fn subsets<const CH: usize>(&self, partition: usize) -> [Moments; 2] {
-        let len = moment_len(CH);
-        let mask = MASKS2[partition][0];
-        let mut one = Moments::default();
-        for (row, table) in self.rows.iter().enumerate() {
-            let part = &table[usize::from((mask >> (4 * row)) & 15)];
-            for k in 0..len {
-                one.m[k] += part.m[k];
-            }
-        }
-        let mut zero = self.total;
-        for k in 0..len {
-            zero.m[k] -= one.m[k];
-        }
-        [zero, one]
+        [self.zero[partition], self.one[partition]]
     }
 
     fn targets<const CH: usize>(
@@ -98,14 +103,38 @@ impl Partitions {
     }
 }
 
-// Mode 0: four stored bits plus a unique p-bit; mode 2: five bits.
+// `best_partitions` for modes 3 (4 selector levels) and 1 (8 levels) in one
+// pass over the shared estimates; each list is ordered exactly as there.
+fn best_partitions_31(est: &[(f32, f32); 64], counts: [usize; 2]) -> [[(f32, usize); 16]; 2] {
+    let steps = [1.0 / 9.0, 1.0 / 49.0];
+    let mut top = [[(f32::MAX, 0usize); 16]; 2];
+    for (p, &(res, var)) in est.iter().enumerate() {
+        for r in 0..2 {
+            let count = counts[r].min(16);
+            if count == 0 {
+                continue;
+            }
+            let e = res + var * steps[r];
+            let top = &mut top[r];
+            if e < top[count - 1].0 {
+                let mut k = count - 1;
+                while k > 0 && e < top[k - 1].0 {
+                    top[k] = top[k - 1];
+                    k -= 1;
+                }
+                top[k] = (e, p);
+            }
+        }
+    }
+    top
+}
+
+// Mode 0: four stored bits plus a unique p-bit. No preset searches the
+// other three-subset mode (2): its ranking does not fit a block budget,
+// and Intel basic does not search it either.
 pub(super) const P0: Prec = Prec {
     bits: 5,
     pbit: PBit::Unique,
-};
-pub(super) const P2: Prec = Prec {
-    bits: 5,
-    pbit: PBit::None,
 };
 
 // The three subset masks of a three-subset partition.
@@ -115,12 +144,12 @@ fn masks3(partition: usize) -> [u16; 3] {
 }
 
 // Estimated (residual, principal variance) of the first `count`
-// three-subset partitions; the rest are left unranked.
-fn partition_estimates3(px: &Block, count: usize) -> [(f32, f32); 64] {
+// three-subset partitions from the RGB row moments of the two-subset
+// ranking; the rest are left unranked.
+fn partition_estimates3(lut: &[[Moments; 16]; 4], count: usize) -> [(f32, f32); 64] {
     let len = moment_len(3);
-    let lut = moment_rows::<3>(px);
     let mut total = Moments::default();
-    for row in &lut {
+    for row in lut {
         for k in 0..len {
             total.m[k] += row[15].m[k];
         }
@@ -152,45 +181,30 @@ fn partition_estimates3(px: &Block, count: usize) -> [(f32, f32); 64] {
     out
 }
 
+// Mode 0 fit of each subset of a three-subset partition.
 fn fit_partition3(
     px: &Block,
-    mode: usize,
+    all: &Reps,
     partition: usize,
     iters: usize,
     rounds: usize,
 ) -> [Fit; 3] {
-    let all = Reps::distinct(px);
-    masks3(partition).map(|mask| {
-        let reps = all.masked(mask);
-        if mode == 0 {
-            fit::<0, 3>(px, &reps, P0, &L3, iters, rounds, false)
-        } else {
-            fit::<0, 3>(px, &reps, P2, &L2, iters, rounds, false)
-        }
-    })
+    masks3(partition).map(|mask| fit::<0, 3>(px, &all.masked(mask), P0, &L3, iters, rounds, false))
 }
 
-// Three-subset modes 0 and 2.
-fn pack3(mode: usize, partition: usize, mut s: [Fit; 3]) -> [u8; 16] {
+// Three-subset mode 0.
+fn pack3(partition: usize, mut s: [Fit; 3]) -> [u8; 16] {
+    // Four stored endpoint bits plus a unique p-bit, 3-bit selectors.
+    let width = 4;
     let masks = masks3(partition);
-    let (levels, width, pbits) = if mode == 0 {
-        (8, 4, true)
-    } else {
-        (4, 5, false)
-    };
     let anchors = [0, ANCHOR3A[partition], ANCHOR3B[partition]];
     for k in 0..3 {
-        anchor(&mut s[k], masks[k], anchors[k], levels);
+        anchor(&mut s[k], masks[k], anchors[k], 8);
     }
     let mut bits = 0u128;
     let mut o = 0;
-    put(&mut bits, &mut o, 1 << mode, (mode + 1) as u32);
-    put(
-        &mut bits,
-        &mut o,
-        partition as u32,
-        if mode == 0 { 4 } else { 6 },
-    );
+    put(&mut bits, &mut o, 1, 1);
+    put(&mut bits, &mut o, partition as u32, 4);
     for c in 0..3 {
         for f in &s {
             for e in &f.d {
@@ -203,21 +217,18 @@ fn pack3(mode: usize, partition: usize, mut s: [Fit; 3]) -> [u8; 16] {
             }
         }
     }
-    if pbits {
-        for f in &s {
-            for e in &f.d {
-                put(&mut bits, &mut o, ((e[0] >> (7 - width)) & 1) as u32, 1);
-            }
+    for f in &s {
+        for e in &f.d {
+            put(&mut bits, &mut o, ((e[0] >> (7 - width)) & 1) as u32, 1);
         }
     }
-    let ib = if levels == 8 { 3 } else { 2 };
     for i in 0..16 {
         let k = masks.iter().position(|m| m >> i & 1 == 1).unwrap_or(0);
         put(
             &mut bits,
             &mut o,
             u32::from(s[k].idx[i]),
-            ib - u32::from(anchors[k] == i),
+            3 - u32::from(anchors[k] == i),
         );
     }
     debug_assert_eq!(o, 128);
@@ -234,21 +245,37 @@ pub(crate) struct Search {
     rough_iters: usize,
     mode4_iters: usize,
     parts: [usize; 3],
-    parts3: [usize; 2],
+    /// Three-subset mode 0 partitions fitted.
+    parts3: usize,
     pub(super) refine_iters: usize,
     pub(super) refine_rounds: usize,
+    /// Other p-bit assignments refitted during refinement, best quantized first.
+    pub(super) pbit_tries: usize,
+    /// Whether a near-tied second partition per mode is also refined.
+    runner_up: bool,
+    /// Work ceiling of one block in representative passes (see [`Work`]).
+    /// It is the same for every block; allowances above only order and
+    /// limit the candidates that compete for it.
+    budget: u32,
 }
 
 pub(crate) const BALANCED: Search = Search {
     quality: false,
     axis_rounds: 1,
     duals: [1, 2],
-    rough_iters: 1,
+    rough_iters: BALANCED_ROUGH_ITERS,
     mode4_iters: 1,
-    parts: [4, 4, 8],
-    parts3: [0, 0],
-    refine_iters: 3,
+    parts: [
+        4 * BALANCED_PARTS_PER_UNIT,
+        4 * BALANCED_PARTS_PER_UNIT,
+        8 * BALANCED_PARTS_PER_UNIT,
+    ],
+    parts3: 1,
+    refine_iters: BALANCED_REFINE_ITERS,
     refine_rounds: 1,
+    pbit_tries: BALANCED_PBIT_TRIES,
+    runner_up: BALANCED_RUNNER_UP,
+    budget: BALANCED_BUDGET,
 };
 
 pub(crate) const QUALITY: Search = Search {
@@ -258,19 +285,164 @@ pub(crate) const QUALITY: Search = Search {
     rough_iters: 1,
     mode4_iters: 2,
     parts: [8, 8, 16],
-    parts3: [4, 4],
+    parts3: 4,
     refine_iters: 4,
     refine_rounds: 2,
+    pbit_tries: 3,
+    runner_up: true,
+    budget: QUALITY_BUDGET,
 };
+
+const BALANCED_BUDGET: u32 = 1300;
+const QUALITY_BUDGET: u32 = 2000;
+const BALANCED_PBIT_TRIES: usize = 3;
+const BALANCED_RUNNER_UP: bool = true;
+const BALANCED_REFINE_ITERS: usize = 3;
+const ESCALATE_BREADTH: bool = true;
+// Two-subset partitions per allowance unit, and least-squares passes per rough
+// fit, in Balanced.
+const BALANCED_PARTS_PER_UNIT: usize = 1;
+const BALANCED_ROUGH_ITERS: usize = 1;
+// At least this many mode 5 rotations and mode 4 rotation/selection pairs
+// are fitted for nonopaque Balanced blocks.
+const BALANCED_VISIBLE_DUALS: [usize; 2] = [0, 0];
+// Percent of the work left after mode 6 that only refinement may spend.
+const REFINE_SHARE: u32 = 40;
+
+// Visible colour error weight relative to alpha in nonopaque blocks.
+const COLOUR_WEIGHT: u8 = 1;
+// Whether the dual-mode estimate of a nonopaque block charges alpha
+// selector steps only to texels strictly between its extreme alphas.
+const VISIBLE_EXTREME_ALPHA: bool = true;
+
+/// Remaining work of one block, counted in representative passes: one unit
+/// is one distinct texel evaluated by one selector pass. Every optional step
+/// is charged its worst case before it runs and is skipped when the
+/// remaining work cannot pay for it, so the search of any block performs at
+/// most the fixed seed and ranking work plus the preset budget, whatever the
+/// content. Early exits inside a paid step only leave work unspent.
+struct Work(u32);
+
+impl Work {
+    fn take(&mut self, cost: u32) -> bool {
+        if cost <= self.0 {
+            self.0 -= cost;
+            true
+        } else {
+            false
+        }
+    }
+
+    // Return the unused part of a charge once the step reports the passes it
+    // performed; the bound still holds because a step never exceeds its charge.
+    fn refund(&mut self, charged: u32, used: u32) {
+        self.0 += charged - used.min(charged);
+    }
+}
+
+// Worst-case charges, in representative passes over `n` representatives.
+// A selector pass costs n, a least-squares solve n, a polish pass (five
+// endpoint sums per channel, then one selector pass) 3n and a principal
+// axis (covariance, power iterations and projections) 2n.
+const fn axis_work(n: u32) -> u32 {
+    2 * n
+}
+
+const fn improve_work(n: u32, iters: usize, rounds: usize) -> u32 {
+    n * (2 * iters as u32 + 3 * rounds as u32)
+}
+
+const fn rough_work(n: u32, iters: usize) -> u32 {
+    n * (1 + 2 * iters as u32)
+}
+
+const fn parity_work(n: u32, prec: Prec, cfg: &Search) -> u32 {
+    let others = match prec.pbit {
+        PBit::None => return 0,
+        PBit::Unique => 3,
+        PBit::Shared => 1,
+    };
+    let tries = if cfg.pbit_tries < others {
+        cfg.pbit_tries as u32
+    } else {
+        others as u32
+    };
+    if tries == 0 {
+        return 0;
+    }
+    n * (1 + tries * (1 + 2 * cfg.refine_iters as u32))
+}
+
+// Parity and improvement of one subset, as in `refine_subset`.
+fn refine_work(mode: usize, n: u32, cfg: &Search, opaque: bool) -> u32 {
+    let parity = match mode {
+        0 => parity_work(n, P0, cfg),
+        1 => parity_work(n, P1, cfg),
+        3 => parity_work(n, P3, cfg),
+        7 if !opaque => parity_work(n, P7, cfg),
+        _ => 0,
+    };
+    parity + improve_work(n, cfg.refine_iters, cfg.refine_rounds)
+}
+
+// The representatives of each subset of a partition.
+fn subset_len(reps: &Reps, masks: &[u16]) -> u32 {
+    masks.iter().map(|&m| reps.masked(m).len as u32).sum()
+}
+
+// Representatives of every subset of an opaque candidate, per channel group.
+fn candidate_len(reps: &Reps, candidate: &Cand) -> u32 {
+    match candidate {
+        Cand::Two { partition, .. } => {
+            let m = MASKS2[*partition][0];
+            subset_len(reps, &[!m, m])
+        }
+        Cand::Three { partition, .. } => subset_len(reps, &masks3(*partition)),
+        _ => reps.len as u32,
+    }
+}
+
+// Endpoint-lattice moves of `precision`: each colour channel (and the scalar
+// channel of a dual-stream candidate) tries four or eight moves.
+fn precision_work(reps: &Reps, candidate: &Cand, diagonals: bool) -> u32 {
+    let moves = if diagonals { 4 } else { 8 };
+    let channels = if matches!(candidate, Cand::Dual { .. }) {
+        4
+    } else {
+        3
+    };
+    moves * channels * candidate_len(reps, candidate)
+}
+
+// A second principal-axis seed per subset (two axes are compared), its
+// rough fit and refinement, as in `alternate_seed`.
+fn alternate_work(reps: &Reps, candidate: &Cand, cfg: &Search) -> u32 {
+    let n = candidate_len(reps, candidate);
+    match candidate {
+        Cand::Six(_) => {
+            axis_work(n)
+                + rough_work(n, cfg.refine_iters)
+                + improve_work(n, cfg.refine_iters, cfg.refine_rounds)
+        }
+        Cand::Two { mode, .. } => {
+            2 * axis_work(n) + rough_work(n, cfg.rough_iters) + refine_work(*mode, n, cfg, true)
+        }
+        Cand::Three { .. } => {
+            2 * axis_work(n) + rough_work(n, cfg.rough_iters) + refine_work(0, n, cfg, true)
+        }
+        Cand::Dual { .. } => 0,
+    }
+}
 
 impl Search {
     fn for_opaque_block(self, units: usize) -> Self {
         let mut local = self.for_block(units);
         // A small seed residual can conceal a missed partition on fine detail.
-        // Spend at most four rough fits per two-subset mode in that case.
+        // Spend at most four rough fits per two-subset mode in that case:
+        // mode 1 recall decides low-residual blocks where mode 6 is close.
         if units == 1 {
             local.parts[0] = if local.quality { 4 } else { 2 };
-            local.parts[1] = if local.quality { 4 } else { 1 };
+            local.parts[1] = 4;
         }
         local
     }
@@ -284,8 +456,13 @@ impl Search {
             axis_rounds: if units == 1 { self.axis_rounds } else { 0 },
             duals: [self.duals[0], (scale + units / 2).min(self.duals[1])],
             rough_iters: self.rough_iters,
-            parts: [scale * units, scale * units, 2 * scale * units],
-            parts3: if self.quality { [units, units] } else { [0, 0] },
+            parts: if self.quality {
+                [scale * units, scale * units, 2 * scale * units]
+            } else {
+                let per = BALANCED_PARTS_PER_UNIT;
+                [per * units, per * units, 2 * per * units]
+            },
+            parts3: if self.quality { units } else { self.parts3 },
             refine_iters: (scale + 1 + units / 2).min(self.refine_iters),
             ..self
         }
@@ -307,8 +484,8 @@ enum Cand {
         partition: usize,
         s: [Fit; 2],
     },
+    /// Three-subset mode 0.
     Three {
-        mode: usize,
         partition: usize,
         s: [Fit; 3],
     },
@@ -326,19 +503,17 @@ impl Cand {
                 alpha,
             } => pack_dual(mode, rotation, sel, color, alpha),
             Cand::Two { mode, partition, s } => pack2(mode, partition, s),
-            Cand::Three { mode, partition, s } => pack3(mode, partition, s),
+            Cand::Three { partition, s } => pack3(partition, s),
         }
     }
 }
 
-type RankedPartition<const N: usize> = (u32, usize, usize, [Fit; N]);
-type RankedTwo = RankedPartition<2>;
-type RankedThree = RankedPartition<3>;
+// (error, mode, partition, subsets) of a two-subset candidate.
+type RankedTwo = (u32, usize, usize, [Fit; 2]);
+// (error, partition, subsets) of a three-subset mode 0 candidate.
+type RankedThree = (u32, usize, [Fit; 3]);
 
-fn retain_partition<const N: usize>(
-    kept: &mut [Option<RankedPartition<N>>; 2],
-    candidate: RankedPartition<N>,
-) {
+fn retain_partition(kept: &mut [Option<RankedTwo>; 2], candidate: RankedTwo) {
     if kept[0].is_none_or(|k| candidate.0 < k.0) {
         kept[1] = kept[0];
         kept[0] = Some(candidate);
@@ -348,6 +523,84 @@ fn retain_partition<const N: usize>(
 }
 
 type RankedDual = (u32, usize, usize, usize, Fit, Fit);
+
+// A rough fit the opaque search may spend breadth on.
+#[derive(Clone, Copy)]
+enum Plan {
+    Dual {
+        mode: usize,
+        rotation: usize,
+        slot: usize,
+    },
+    Two {
+        mode: usize,
+        partition: usize,
+    },
+    Three {
+        partition: usize,
+    },
+}
+
+// Planned fits ordered by estimate, lowest first; ties keep insertion order.
+// The preset ceilings propose at most 6 dual, 16 two-subset and 8
+// three-subset fits.
+struct Ranking<const N: usize> {
+    items: [(f32, Plan); N],
+    len: usize,
+}
+
+impl<const N: usize> Default for Ranking<N> {
+    fn default() -> Self {
+        Self {
+            items: [(
+                f32::MAX,
+                Plan::Two {
+                    mode: 0,
+                    partition: 0,
+                },
+            ); N],
+            len: 0,
+        }
+    }
+}
+
+impl<const N: usize> Ranking<N> {
+    fn insert(&mut self, estimate: f32, plan: Plan) {
+        debug_assert!(self.len < self.items.len());
+        if self.len == self.items.len() {
+            return;
+        }
+        let mut at = self.len;
+        while at > 0 && estimate < self.items[at - 1].0 {
+            self.items[at] = self.items[at - 1];
+            at -= 1;
+        }
+        self.items[at] = (estimate, plan);
+        self.len += 1;
+    }
+
+    fn best(&self, count: usize) -> &[(f32, Plan)] {
+        &self.items[..count.min(self.len)]
+    }
+}
+
+// A rough candidate awaiting refinement, with its rough decoded error.
+#[derive(Clone, Copy)]
+enum Rough {
+    Dual(RankedDual),
+    Two(RankedTwo),
+    Three(RankedThree),
+}
+
+impl Rough {
+    fn err(&self) -> u32 {
+        match self {
+            Rough::Dual(r) => r.0,
+            Rough::Two(r) => r.0,
+            Rough::Three(r) => r.0,
+        }
+    }
+}
 
 // Estimated error of mode 5 ([r][0]) and mode 4 with each index selection
 // ([r][1], [r][2]) after rotation r: the colour channels' off-axis residual
@@ -438,8 +691,44 @@ pub(super) fn parity_of<const C0: usize>(d: &Pair, prec: Prec) -> [usize; 2] {
     [0, 1].map(|k| ((d[k][C0] >> shift) & 1) as usize)
 }
 
-// Fit again under every other p-bit assignment the precision allows, from
-// the least-squares targets of the current selectors; keep the best.
+// The other p-bit assignments of `prec`, ranked by how closely they quantize
+// the least-squares targets `t` (ties keep the fixed order).
+pub(super) fn ranked_parities<const C0: usize, const C1: usize>(
+    t: &Pair,
+    prec: Prec,
+    current: [usize; 2],
+) -> ([[usize; 2]; 3], usize) {
+    let combos: &[[usize; 2]] = match prec.pbit {
+        PBit::None => &[],
+        PBit::Unique => &[[0, 0], [0, 1], [1, 0], [1, 1]],
+        PBit::Shared => &[[0, 0], [1, 1]],
+    };
+    let mut ranked = [(0i32, [0usize; 2]); 3];
+    let mut len = 0;
+    for &p in combos {
+        if p == current {
+            continue;
+        }
+        let d = quantize_with::<C0, C1>(t, prec, p);
+        let mut e = 0;
+        for k in 0..2 {
+            for c in C0..C1 {
+                e += (t[k][c] - d[k][c]).pow(2);
+            }
+        }
+        let mut at = len;
+        while at > 0 && e < ranked[at - 1].0 {
+            ranked[at] = ranked[at - 1];
+            at -= 1;
+        }
+        ranked[at] = (e, p);
+        len += 1;
+    }
+    (ranked.map(|r| r.1), len)
+}
+
+// Fit again under the `tries` other p-bit assignments that best quantize the
+// least-squares targets of the current selectors; keep the best.
 fn parity<const C0: usize, const C1: usize>(
     px: &Block,
     reps: &Reps,
@@ -447,34 +736,32 @@ fn parity<const C0: usize, const C1: usize>(
     prec: Prec,
     lv: &Levels,
     iters: usize,
-) {
-    let combos: &[[usize; 2]] = match prec.pbit {
-        PBit::None => return,
-        PBit::Unique => &[[0, 0], [0, 1], [1, 0], [1, 1]],
-        PBit::Shared => &[[0, 0], [1, 1]],
-    };
-    if f.err == 0 {
-        return;
+    tries: usize,
+) -> u32 {
+    // Passes performed: each least-squares solve and selector pass is one.
+    if prec.pbit == PBit::None || f.err == 0 || tries == 0 {
+        return 0;
     }
+    let mut passes = 1;
     let Some(t) = least_squares::<C0, C1>(px, reps, &f.idx, lv) else {
-        return;
+        return passes;
     };
     let current = parity_of::<C0>(&f.d, prec);
-    for &p in combos {
-        if p == current {
-            continue;
-        }
+    let (ranked, len) = ranked_parities::<C0, C1>(&t, prec, current);
+    for &p in &ranked[..len.min(tries)] {
         let d = quantize_with::<C0, C1>(&t, prec, p);
         let mut g = Fit {
             err: 0,
             d,
             idx: f.idx,
         };
+        passes += 1;
         g.err = select::<C0, C1>(px, reps, &d, lv, &mut g.idx, u32::MAX);
         for _ in 0..iters {
             if g.err == 0 {
                 break;
             }
+            passes += 1;
             let Some(t) = least_squares::<C0, C1>(px, reps, &g.idx, lv) else {
                 break;
             };
@@ -482,6 +769,7 @@ fn parity<const C0: usize, const C1: usize>(
             if d == g.d {
                 break;
             }
+            passes += 1;
             let mut idx = g.idx;
             let err = select::<C0, C1>(px, reps, &d, lv, &mut idx, g.err);
             if err >= g.err {
@@ -493,6 +781,7 @@ fn parity<const C0: usize, const C1: usize>(
             *f = g;
         }
     }
+    passes
 }
 
 // Colour and scalar precision and selector levels of mode 5, or of mode 4
@@ -580,15 +869,15 @@ fn refine_dual(
     alpha: &mut Fit,
     cfg: &Search,
     compact: bool,
-) {
+) -> u32 {
     let (cp, cl, ap, al) = dual_layout(mode, sel);
     let (iters, rounds) = (cfg.refine_iters, cfg.refine_rounds);
-    if compact {
-        improve::<0, 2>(px, reps, color, cp, cl, iters, rounds, false);
+    let colour = if compact {
+        improve::<0, 2>(px, reps, color, cp, cl, iters, rounds, false)
     } else {
-        improve::<0, 3>(px, reps, color, cp, cl, iters, rounds, false);
-    }
-    improve::<3, 4>(px, reps, alpha, ap, al, iters, rounds, false);
+        improve::<0, 3>(px, reps, color, cp, cl, iters, rounds, false)
+    };
+    colour + improve::<3, 4>(px, reps, alpha, ap, al, iters, rounds, false)
 }
 
 // Endpoints of one subset from its axis targets, then `iters` least-squares
@@ -644,31 +933,40 @@ fn rough(
 }
 
 // Extra passes on one subset of a two-subset candidate.
-fn refine_subset(px: &Block, mode: usize, reps: &Reps, f: &mut Fit, opaque: bool, cfg: &Search) {
-    let (iters, rounds) = (cfg.refine_iters, cfg.refine_rounds);
+// Returns the passes performed (see `improve`).
+fn refine_subset(
+    px: &Block,
+    mode: usize,
+    reps: &Reps,
+    f: &mut Fit,
+    opaque: bool,
+    cfg: &Search,
+) -> u32 {
+    let (iters, rounds, tries) = (cfg.refine_iters, cfg.refine_rounds, cfg.pbit_tries);
     match mode {
         0 => {
-            parity::<0, 3>(px, reps, f, P0, &L3, iters);
-            improve::<0, 3>(px, reps, f, P0, &L3, iters, rounds, false);
+            parity::<0, 3>(px, reps, f, P0, &L3, iters, tries)
+                + improve::<0, 3>(px, reps, f, P0, &L3, iters, rounds, false)
         }
-        2 => improve::<0, 3>(px, reps, f, P2, &L2, iters, rounds, false),
         1 => {
-            parity::<0, 3>(px, reps, f, P1, &L3, iters);
-            improve::<0, 3>(px, reps, f, P1, &L3, iters, rounds, false);
+            parity::<0, 3>(px, reps, f, P1, &L3, iters, tries)
+                + improve::<0, 3>(px, reps, f, P1, &L3, iters, rounds, false)
         }
         3 => {
-            parity::<0, 3>(px, reps, f, P3, &L2, iters);
-            improve::<0, 3>(px, reps, f, P3, &L2, iters, rounds, false);
+            parity::<0, 3>(px, reps, f, P3, &L2, iters, tries)
+                + improve::<0, 3>(px, reps, f, P3, &L2, iters, rounds, false)
         }
         _ => {
+            let mut passes = 0;
             if !opaque {
-                parity::<0, 4>(px, reps, f, P7, &L2, iters);
+                passes += parity::<0, 4>(px, reps, f, P7, &L2, iters, tries);
             }
-            improve::<0, 4>(px, reps, f, P7, &L2, iters, rounds, opaque);
+            passes += improve::<0, 4>(px, reps, f, P7, &L2, iters, rounds, opaque);
             if opaque {
                 f.d[0][3] = 255;
                 f.d[1][3] = 255;
             }
+            passes
         }
     }
 }
@@ -739,10 +1037,9 @@ fn precision(px: &Block, reps: &Reps, candidate: &mut Cand, diagonals: bool) -> 
             }
             s.iter().map(|f| f.err).sum()
         }
-        Cand::Three { mode, partition, s } => {
-            let (prec, lv) = if *mode == 0 { (P0, &L3) } else { (P2, &L2) };
+        Cand::Three { partition, s } => {
             for (f, mask) in s.iter_mut().zip(masks3(*partition)) {
-                lattice::<0, 3>(px, &reps.masked(mask), f, prec, lv, diagonals);
+                lattice::<0, 3>(px, &reps.masked(mask), f, P0, &L3, diagonals);
             }
             s.iter().map(|f| f.err).sum()
         }
@@ -897,8 +1194,7 @@ fn alternate_seed(px: &Block, reps: &Reps, candidate: &mut Cand, cfg: &Search) -
             }
             s.iter().map(|f| f.err).sum()
         }
-        Cand::Three { mode, partition, s } => {
-            let (prec, lv) = if *mode == 0 { (P0, &L3) } else { (P2, &L2) };
+        Cand::Three { partition, s } => {
             for (f, mask) in s.iter_mut().zip(masks3(*partition)) {
                 let r = reps.masked(mask);
                 let t = recall_axis_targets::<0, 3>(px, &r);
@@ -908,8 +1204,8 @@ fn alternate_seed(px: &Block, reps: &Reps, candidate: &mut Cand, cfg: &Search) -
                     continue;
                 }
                 let mut g =
-                    rough_with::<0, 3>(px, &r, &t, prec, lv, cfg.rough_iters, false, u32::MAX);
-                refine_subset(px, *mode, &r, &mut g, true, cfg);
+                    rough_with::<0, 3>(px, &r, &t, P0, &L3, cfg.rough_iters, false, u32::MAX);
+                refine_subset(px, 0, &r, &mut g, true, cfg);
                 if g.err < f.err {
                     *f = g;
                 }
@@ -940,6 +1236,9 @@ fn search_seeded(px: &Block, cfg: &Search, seed: Option<Fit>) -> (u32, Cand) {
     // The early return above routes every nonopaque block separately.
     let opaque = true;
     let reps = Reps::distinct(px);
+    // The preset's ceiling, fixed before any allowance is chosen.
+    let mut work = Work(cfg.budget);
+    let n = reps.len as u32;
     let mut m6 = if opaque {
         seed.unwrap_or_else(|| fit::<0, 3>(px, &reps, P6, &L4, 1, 0, true))
     } else {
@@ -967,29 +1266,74 @@ fn search_seeded(px: &Block, cfg: &Search, seed: Option<Fit>) -> (u32, Cand) {
     // Sparse ramps and gradients with a near-zero channel need endpoint
     // precision even when their seed residual earns only one search unit.
     let extra_precision = !cfg.quality && (reps.len <= 4 || saturated);
-    let cfg = &if !cfg.quality && (reps.len <= 4 || grey || saturated) {
-        QUALITY.for_opaque_block(units)
-    } else {
-        let mut local = cfg.for_opaque_block(units);
-        if !cfg.quality && units == 1 && detail {
-            local.parts[1] = 3;
-        }
-        local
+    // Escalated Balanced blocks use Quality's allowance with Balanced axis
+    // rounds.
+    let deep = Search {
+        axis_rounds: cfg.for_opaque_block(units).axis_rounds,
+        ..QUALITY.for_opaque_block(units)
     };
+    let cfg = &if !cfg.quality && reps.len <= 4 {
+        deep
+    } else if !cfg.quality && (grey || saturated) {
+        // Quality's refinement depth and alternate seed; breadth stays
+        // Balanced unless the preset escalates it too.
+        if ESCALATE_BREADTH {
+            deep
+        } else {
+            let local = cfg.for_opaque_block(units);
+            Search {
+                duals: local.duals,
+                parts: local.parts,
+                parts3: local.parts3,
+                ..deep
+            }
+        }
+    } else {
+        cfg.for_opaque_block(units)
+    };
+    // Endpoint precision of low-residual and sparse or saturated blocks runs
+    // last; hold its work back so that breadth cannot spend it first.
+    // Only the first lattice pass is held back; a second one runs if work
+    // remains.
+    let diagonals = !cfg.quality && !detail;
+    let mut reserve = if units == 1 && diagonals {
+        12 * n
+    } else if units == 1 || extra_precision {
+        24 * n
+    } else {
+        0
+    };
+    if !work.take(reserve) {
+        reserve = 0;
+    }
     if opaque {
-        improve::<0, 3>(
+        let charge = improve_work(n, cfg.refine_iters, cfg.refine_rounds);
+        if work.take(charge) {
+            let passes = improve::<0, 3>(
+                px,
+                &reps,
+                &mut m6,
+                P6,
+                &L4,
+                cfg.refine_iters,
+                cfg.refine_rounds,
+                true,
+            );
+            work.refund(charge, passes * n);
+        }
+        if work.take(8 * n * cfg.axis_rounds as u32) {
+            axis_search::<0, 3>(px, &reps, &mut m6, &L4, 2, cfg.axis_rounds);
+        }
+    } else {
+        parity::<0, 4>(
             px,
             &reps,
             &mut m6,
             P6,
             &L4,
             cfg.refine_iters,
-            cfg.refine_rounds,
-            true,
+            cfg.pbit_tries,
         );
-        axis_search::<0, 3>(px, &reps, &mut m6, &L4, 2, cfg.axis_rounds);
-    } else {
-        parity::<0, 4>(px, &reps, &mut m6, P6, &L4, cfg.refine_iters);
         improve::<0, 4>(
             px,
             &reps,
@@ -1010,36 +1354,135 @@ fn search_seeded(px: &Block, cfg: &Search, seed: Option<Fit>) -> (u32, Cand) {
     if best_err == 0 {
         return (0, best);
     }
-    // Modes 5 and 4 with each channel in the scalar slot. Rotation 0 of an
-    // opaque block keeps alpha in the scalar slot, where it is exact.
-    // Each mode fits the rotations (and mode 4 selections) with the lowest
-    // estimates.
+    // Rough fits of every mode family compete for one refinement pool.
+    // Breadth may spend only the work above the refinement share; whatever
+    // it leaves joins that share.
+    let share = work.0 / 100 * REFINE_SHARE;
+    let mut broad = Work(work.0 - share);
+    work.0 = share;
+    let mut pool: [Option<Rough>; 7] = [None; 7];
+    // Every family proposes its candidates with its cheap estimate, all in
+    // block SSE units: modes 5 and 4 by rotation and index selection, the
+    // two-subset partitions of modes 3 and 1 and the three-subset partitions
+    // of mode 0. One ranking orders them; rough fits run best first
+    // while breadth lasts. Rotation 0 of an opaque block keeps alpha in the
+    // scalar slot, where mode 5 is exact, so mode 4 skips it.
     let alpha_varies = false;
     let flat_extreme_alpha = opaque || (!alpha_varies && px[0][3] == 0);
     let est = dual_estimates(px, &reps);
-    let mut tried = [[false; 3]; 4];
-    // Modes 4 and 5 share principal-axis targets for each rotation.
-    let mut targets = [None; 4];
-    let mut kept_dual: [Option<RankedDual>; 2] = [None; 2];
-    for (mode, choices) in [(5usize, cfg.duals[0]), (4, cfg.duals[1])] {
-        for _ in 0..choices {
-            let mut pick: Option<(f32, usize, usize)> = None;
-            for rotation in 0..4 {
-                for sel in if mode == 5 { 0..1 } else { 1..3 } {
-                    // Constant alpha in the scalar slot is exact in mode 5.
-                    if tried[rotation][sel] || (mode == 4 && rotation == 0 && !alpha_varies) {
-                        continue;
-                    }
-                    let e = est.error[rotation][sel];
-                    if pick.is_none_or(|p| e < p.0) {
-                        pick = Some((e, rotation, sel));
-                    }
+    let partitions = Partitions::new::<3>(px);
+    let mut plan = Ranking::<32>::default();
+    for (mode, count) in [(5usize, cfg.duals[0]), (4, cfg.duals[1])] {
+        // Four rotations, or three rotations with two index selections.
+        let mut options = Ranking::<6>::default();
+        for rotation in 0..4 {
+            for slot in if mode == 5 { 0..1 } else { 1..3 } {
+                if mode == 4 && rotation == 0 && !alpha_varies {
+                    continue;
                 }
+                options.insert(
+                    est.error[rotation][slot],
+                    Plan::Dual {
+                        mode,
+                        rotation,
+                        slot,
+                    },
+                );
             }
-            let Some((_, rotation, slot)) = pick else {
-                break;
+        }
+        for &(e, p) in options.best(count) {
+            plan.insert(e, p);
+        }
+    }
+    let counts = [cfg.parts[0], cfg.parts[1]];
+    let ranked = best_partitions_31(&partitions.est, counts);
+    for ((mode, count), best) in [3usize, 1].into_iter().zip(counts).zip(&ranked) {
+        for &(e, partition) in &best[..count] {
+            plan.insert(e, Plan::Two { mode, partition });
+        }
+    }
+    // Mode 0 ranks its 16 partitions; a ranked three-subset estimate costs
+    // about eight passes (three subset moment sums and estimates).
+    let (count, ranked) = (cfg.parts3, 16);
+    if count > 0 && broad.take(8 * ranked as u32) {
+        let est3 = partition_estimates3(&partitions.rows, ranked);
+        for &(e, partition) in &best_partitions(&est3, 8.0, count)[..count] {
+            plan.insert(e, Plan::Three { partition });
+        }
+    }
+    // Modes 4 and 5 share principal-axis targets for each rotation; modes 3
+    // and 1 share them for each partition.
+    let mut targets = [None; 4];
+    let mut shared: [Option<(usize, [Pair; 2])>; 4] = [None; 4];
+    let mut kept_dual: [Option<RankedDual>; 2] = [None; 2];
+    let mut kept: [[Option<RankedTwo>; 2]; 2] = [[None; 2]; 2];
+    let mut kept3: Option<RankedThree> = None;
+    for &(_, step) in plan.best(plan.len) {
+        if let Plan::Two { mode, partition } = step {
+            let m1 = MASKS2[partition][0];
+            let sub = [reps.masked(!m1), reps.masked(m1)];
+            let k = (sub[0].len + sub[1].len) as u32;
+            let known = shared
+                .iter()
+                .flatten()
+                .find(|s| s.0 == partition)
+                .map(|s| s.1);
+            let axis = if known.is_none() { axis_work(k) } else { 0 };
+            if !broad.take(axis + rough_work(k, cfg.rough_iters)) {
+                continue;
+            }
+            let t = known.unwrap_or_else(|| {
+                let t = partitions.targets::<3>(px, &sub, partition);
+                shared.rotate_right(1);
+                shared[0] = Some((partition, t));
+                t
+            });
+            let s =
+                [0, 1].map(|k| rough(px, &sub[k], &t[k], mode, true, cfg.rough_iters, u32::MAX));
+            let err = s[0].err + s[1].err;
+            if err == 0 {
+                return (0, Cand::Two { mode, partition, s });
+            }
+            retain_partition(&mut kept[usize::from(mode == 1)], (err, mode, partition, s));
+            continue;
+        }
+        if let Plan::Three { partition } = step {
+            let k = subset_len(&reps, &masks3(partition));
+            if !broad.take(axis_work(k) + rough_work(k, cfg.rough_iters)) {
+                continue;
+            }
+            let s = fit_partition3(px, &reps, partition, cfg.rough_iters, 0);
+            let err = s[0].err + s[1].err + s[2].err;
+            if err == 0 {
+                return (0, Cand::Three { partition, s });
+            }
+            if kept3.is_none_or(|k| err < k.0) {
+                kept3 = Some((err, partition, s));
+            }
+            continue;
+        }
+        let Plan::Dual {
+            mode,
+            rotation,
+            slot,
+        } = step
+        else {
+            continue;
+        };
+        {
+            let iters = if mode == 4 {
+                cfg.mode4_iters
+            } else {
+                cfg.rough_iters
             };
-            tried[rotation][slot] = true;
+            let axis = if targets[rotation].is_none() {
+                axis_work(n)
+            } else {
+                0
+            };
+            if !broad.take(axis + 2 * rough_work(n, iters)) {
+                continue;
+            }
             let sel = slot.saturating_sub(1);
             let compact = flat_extreme_alpha && rotation > 0;
             let map = dual_map(rotation, compact);
@@ -1056,11 +1499,6 @@ fn search_seeded(px: &Block, cfg: &Search, seed: Option<Fit>) -> (u32, Cand) {
                     scalar_targets(&rotated, &reps),
                 ]
             });
-            let iters = if mode == 4 {
-                cfg.mode4_iters
-            } else {
-                cfg.rough_iters
-            };
             let (color, alpha) = dual_fit(&rotated, &reps, t, mode, sel, iters, compact);
             let err = color.err + alpha.err;
             if err == 0 {
@@ -1081,156 +1519,114 @@ fn search_seeded(px: &Block, cfg: &Search, seed: Option<Fit>) -> (u32, Cand) {
             }
         }
     }
-    for (_, mode, rotation, sel, mut color, mut alpha) in kept_dual.into_iter().flatten() {
-        let compact = flat_extreme_alpha && rotation > 0;
-        let map = dual_map(rotation, compact);
-        let rotated = px.map(|p| map.map(|c| p[c]));
-        refine_dual(
-            &rotated, &reps, mode, sel, &mut color, &mut alpha, cfg, compact,
-        );
-        if color.err + alpha.err < best_err {
-            best_err = color.err + alpha.err;
-            best = Cand::Dual {
-                mode,
-                rotation,
-                sel,
-                color: restore_color(color, rotation, compact, px[0][3]),
-                alpha,
-            };
-        }
+    for (slot, kept) in kept_dual.into_iter().enumerate() {
+        pool[slot] = kept.map(Rough::Dual);
     }
-    if best_err > 0 {
-        let partitions = if opaque {
-            Partitions::new::<3>(px)
-        } else {
-            Partitions::new::<4>(px)
-        };
-        let est = &partitions.est;
-        let modes: &[(usize, f32, usize)] = if opaque {
-            &[(3, 4.0, cfg.parts[0]), (1, 8.0, cfg.parts[1])]
-        } else {
-            &[(7, 4.0, cfg.parts[2])]
-        };
-        // The partitions each mode tries, merged so that both opaque modes
-        // share one endpoint-axis fit per subset.
-        let mut wanted = [0u8; 64];
-        let mut order = [0u8; 32];
-        let mut len = 0;
-        for (bit, &(_, levels, count)) in modes.iter().enumerate() {
-            for &(_, partition) in &best_partitions(est, levels, count)[..count] {
-                if wanted[partition] == 0 {
-                    order[len] = partition as u8;
-                    len += 1;
-                }
-                wanted[partition] |= 1 << bit;
-            }
-        }
-        // Complete the bounded rough fits before retaining each mode's
-        // winner and a near-tied runner-up. Initial endpoint error can exceed
-        // a cutoff even when least squares would recover a better candidate.
-        let mut kept: [[Option<RankedTwo>; 2]; 2] = [[None; 2]; 2];
-
-        for &partition in &order[..len] {
-            let partition = usize::from(partition);
-            let m1 = MASKS2[partition][0];
-            let reps = [reps.masked(!m1), reps.masked(m1)];
-            let targets = if opaque {
-                partitions.targets::<3>(px, &reps, partition)
-            } else {
-                partitions.targets::<4>(px, &reps, partition)
-            };
-            for (bit, &(mode, _, _)) in modes.iter().enumerate() {
-                if wanted[partition] >> bit & 1 == 0 {
-                    continue;
-                }
-                let limit = u32::MAX;
-                let mut s = [Fit {
-                    err: 0,
-                    d: [[0; 4]; 2],
-                    idx: [0; 16],
-                }; 2];
-                let mut err = 0;
-                for k in 0..2 {
-                    s[k] = rough(
-                        px,
-                        &reps[k],
-                        &targets[k],
-                        mode,
-                        opaque,
-                        cfg.rough_iters,
-                        limit - err,
-                    );
-                    err += s[k].err;
-                    if err >= limit {
-                        break;
-                    }
-                }
-                if err == 0 {
-                    return (0, Cand::Two { mode, partition, s });
-                }
-                retain_partition(&mut kept[bit], (err, mode, partition, s));
-            }
-        }
-        for list in &mut kept {
-            if list[0]
+    // Each two-subset mode keeps its winner and a near-tied runner-up:
+    // initial endpoint error can exceed a cutoff even when least squares
+    // would recover a better candidate.
+    for list in &mut kept {
+        if !cfg.runner_up
+            || list[0]
                 .zip(list[1])
                 .is_some_and(|(first, second)| second.0 > first.0.saturating_add(first.0 / 4))
-            {
-                list[1] = None;
-            }
-        }
-        for (_, mode, partition, mut s) in kept.into_iter().flatten().flatten() {
-            let m1 = MASKS2[partition][0];
-            for (k, mask) in [!m1, m1].into_iter().enumerate() {
-                refine_subset(px, mode, &reps.masked(mask), &mut s[k], opaque, cfg);
-            }
-            let err = s[0].err + s[1].err;
-            if err < best_err {
-                best_err = err;
-                best = Cand::Two { mode, partition, s };
-            }
-        }
-    }
-    if opaque && best_err > 0 {
-        let mut kept: [Option<RankedThree>; 2] = [None; 2];
-        for (mode, levels, count, ranked) in
-            [(0, 8.0, cfg.parts3[0], 16), (2, 4.0, cfg.parts3[1], 64)]
         {
-            if count == 0 {
-                continue;
-            }
-            let est = partition_estimates3(px, ranked);
-            let top = best_partitions(&est, levels, count);
-            for &(_, partition) in &top[..count] {
-                let s = fit_partition3(px, mode, partition, cfg.rough_iters, 0);
-                let err = s[0].err + s[1].err + s[2].err;
-                if err == 0 {
-                    return (0, Cand::Three { mode, partition, s });
-                }
-                let slot = usize::from(mode == 2);
-                if kept[slot].is_none_or(|k| err < k.0) {
-                    kept[slot] = Some((err, mode, partition, s));
-                }
-            }
-        }
-        for (_, mode, partition, mut s) in kept.into_iter().flatten() {
-            for (k, mask) in masks3(partition).into_iter().enumerate() {
-                refine_subset(px, mode, &reps.masked(mask), &mut s[k], true, cfg);
-            }
-            let err = s[0].err + s[1].err + s[2].err;
-            if err < best_err {
-                best_err = err;
-                best = Cand::Three { mode, partition, s };
-            }
+            list[1] = None;
         }
     }
-    if units == 1 && best_err > 0 {
-        best_err = precision(px, &reps, &mut best, !cfg.quality && !detail);
+    let [[a, b], [c, d]] = kept;
+    for (slot, kept) in [a, b, c, d].into_iter().enumerate() {
+        pool[2 + slot] = kept.map(Rough::Two);
     }
-    if cfg.quality && best_err > 0 {
+    pool[6] = kept3.map(Rough::Three);
+    // Refine the rough candidates, lowest error first, while work remains.
+    // A rough fit more than a quarter above the best refined error rarely
+    // overtakes it. Unrefined candidates still compete with their rough fit.
+    work.0 += broad.0;
+    let mut order = [0usize; 7];
+    let mut len = 0;
+    let err = |slot: usize| pool[slot].map_or(u32::MAX, |r| r.err());
+    for slot in 0..pool.len() {
+        if pool[slot].is_none() {
+            continue;
+        }
+        let mut at = len;
+        while at > 0 && err(slot) < err(order[at - 1]) {
+            order[at] = order[at - 1];
+            at -= 1;
+        }
+        order[at] = slot;
+        len += 1;
+    }
+    for &slot in &order[..len] {
+        let Some(r) = pool[slot] else {
+            continue;
+        };
+        if r.err() > best_err.saturating_add(best_err / 4) {
+            continue;
+        }
+        let candidate = match r {
+            Rough::Dual((_, mode, rotation, sel, mut color, mut alpha)) => {
+                let compact = flat_extreme_alpha && rotation > 0;
+                let charge = 2 * improve_work(n, cfg.refine_iters, cfg.refine_rounds);
+                if work.take(charge) {
+                    let map = dual_map(rotation, compact);
+                    let rotated = px.map(|p| map.map(|c| p[c]));
+                    let passes = refine_dual(
+                        &rotated, &reps, mode, sel, &mut color, &mut alpha, cfg, compact,
+                    );
+                    work.refund(charge, passes * n);
+                }
+                (
+                    color.err + alpha.err,
+                    Cand::Dual {
+                        mode,
+                        rotation,
+                        sel,
+                        color: restore_color(color, rotation, compact, px[0][3]),
+                        alpha,
+                    },
+                )
+            }
+            Rough::Two((_, mode, partition, mut s)) => {
+                let m1 = MASKS2[partition][0];
+                let charge = refine_work(mode, subset_len(&reps, &[!m1, m1]), cfg, true);
+                if work.take(charge) {
+                    let mut used = 0;
+                    for (k, mask) in [!m1, m1].into_iter().enumerate() {
+                        let r = reps.masked(mask);
+                        used += r.len as u32 * refine_subset(px, mode, &r, &mut s[k], true, cfg);
+                    }
+                    work.refund(charge, used);
+                }
+                (s[0].err + s[1].err, Cand::Two { mode, partition, s })
+            }
+            Rough::Three((_, partition, mut s)) => {
+                let masks = masks3(partition);
+                let charge = refine_work(0, subset_len(&reps, &masks), cfg, true);
+                if work.take(charge) {
+                    let mut used = 0;
+                    for (k, mask) in masks.into_iter().enumerate() {
+                        let r = reps.masked(mask);
+                        used += r.len as u32 * refine_subset(px, 0, &r, &mut s[k], true, cfg);
+                    }
+                    work.refund(charge, used);
+                }
+                (s[0].err + s[1].err + s[2].err, Cand::Three { partition, s })
+            }
+        };
+        if candidate.0 < best_err {
+            (best_err, best) = candidate;
+        }
+    }
+    work.0 += reserve;
+    if units == 1 && best_err > 0 && work.take(precision_work(&reps, &best, diagonals)) {
+        best_err = precision(px, &reps, &mut best, diagonals);
+    }
+    if cfg.quality && best_err > 0 && work.take(alternate_work(&reps, &best, cfg)) {
         best_err = alternate_seed(px, &reps, &mut best, cfg);
     }
-    if extra_precision && best_err > 0 {
+    if extra_precision && best_err > 0 && work.take(precision_work(&reps, &best, false)) {
         best_err = precision(px, &reps, &mut best, false);
     }
     (best_err, best)
@@ -1258,25 +1654,56 @@ fn visible_search(source: &Block, cfg: &Search) -> (u32, Cand) {
         visible,
         alpha: 3,
         alpha_weight: 1,
+        colour_weight: COLOUR_WEIGHT,
     });
     let mut m6 = fit::<0, 4>(px, &reps, P6, &L4, 1, 0, false);
     let units = objective::difficulty(px, &reps, m6.err);
     if units == 0 {
         return (0, Cand::Six(m6));
     }
-    let cfg = &cfg.for_block(units);
-    parity::<0, 4>(px, &reps, &mut m6, P6, &L4, cfg.refine_iters);
-    improve::<0, 4>(
-        px,
-        &reps,
-        &mut m6,
-        P6,
-        &L4,
-        cfg.refine_iters,
-        cfg.refine_rounds,
-        false,
-    );
+    let mut work = Work(cfg.budget);
+    let n = reps.len as u32;
+    let lens = |masks: &[u16]| -> u32 { masks.iter().map(|&m| reps.masked(m).len as u32).sum() };
+    let mut local = cfg.for_block(units);
+    if !cfg.quality {
+        // Cutout colour depends on the dual-stream rotation and index
+        // selection; their fits are charged like any other.
+        for k in 0..2 {
+            local.duals[k] = local.duals[k].max(BALANCED_VISIBLE_DUALS[k]);
+        }
+    }
+    let cfg = &local;
+    let charge = parity_work(n, P6, cfg) + improve_work(n, cfg.refine_iters, cfg.refine_rounds);
+    if work.take(charge) {
+        let passes = parity::<0, 4>(
+            px,
+            &reps,
+            &mut m6,
+            P6,
+            &L4,
+            cfg.refine_iters,
+            cfg.pbit_tries,
+        ) + improve::<0, 4>(
+            px,
+            &reps,
+            &mut m6,
+            P6,
+            &L4,
+            cfg.refine_iters,
+            cfg.refine_rounds,
+            false,
+        );
+        work.refund(charge, passes * n);
+    }
     let mut best = (m6.err, Cand::Six(m6));
+    // Texels at the lowest or highest alpha are exact at the scalar
+    // endpoints of modes 4 and 5 (a cutout's alpha needs no selector
+    // steps); only the share of texels between them pays the step term.
+    let (low, high) = px
+        .iter()
+        .fold((255u8, 0u8), |(l, h), p| (l.min(p[3]), h.max(p[3])));
+    let between = px.iter().filter(|p| p[3] != low && p[3] != high).count();
+    let alpha_steps = between as f32 / 16.0;
     let mut estimates = [[0.0; 3]; 4];
     let rotated = [0, 1, 2, 3].map(|rotation| {
         let map = dual_map(rotation, false);
@@ -1284,7 +1711,10 @@ fn visible_search(source: &Block, cfg: &Search) -> (u32, Cand) {
         let mut r = reps;
         r.objective.as_mut().unwrap().alpha = map.iter().position(|&c| c == 3).unwrap() as u8;
         let (res, var) = objective::estimate::<0, 3>(&pixels, &r);
-        let (_, scalar) = objective::estimate::<3, 4>(&pixels, &r);
+        let (_, mut scalar) = objective::estimate::<3, 4>(&pixels, &r);
+        if rotation == 0 && VISIBLE_EXTREME_ALPHA {
+            scalar *= alpha_steps;
+        }
         estimates[rotation] = [
             res + (var + scalar) / 9.0,
             res + var / 9.0 + scalar / 49.0,
@@ -1316,23 +1746,19 @@ fn visible_search(source: &Block, cfg: &Search) -> (u32, Cand) {
             let Some((_, rotation, slot)) = pick else {
                 break;
             };
+            let iters = if mode == 4 {
+                cfg.mode4_iters
+            } else {
+                cfg.rough_iters
+            };
+            if !work.take(2 * (axis_work(n) + rough_work(n, iters))) {
+                break;
+            }
             tried[rotation][slot] = true;
             let sel = slot.saturating_sub(1);
             let (p, r) = &rotated[rotation];
             let targets = [axis_targets::<0, 3>(p, r), axis_targets::<3, 4>(p, r)];
-            let (color, alpha) = dual_fit(
-                p,
-                r,
-                &targets,
-                mode,
-                sel,
-                if mode == 4 {
-                    cfg.mode4_iters
-                } else {
-                    cfg.rough_iters
-                },
-                false,
-            );
+            let (color, alpha) = dual_fit(p, r, &targets, mode, sel, iters, false);
             let err = color.err + alpha.err;
             if mixed_alpha {
                 let ac = usize::from(r.objective.unwrap().alpha);
@@ -1362,8 +1788,12 @@ fn visible_search(source: &Block, cfg: &Search) -> (u32, Cand) {
             .any(|k| (k.1, k.2, k.3) == (candidate.1, candidate.2, candidate.3))
     });
     for (_, mode, rotation, sel, mut color, mut alpha) in kept.into_iter().flatten().chain(extra) {
-        let (p, r) = &rotated[rotation];
-        refine_dual(p, r, mode, sel, &mut color, &mut alpha, cfg, false);
+        let charge = 2 * improve_work(n, cfg.refine_iters, cfg.refine_rounds);
+        if work.take(charge) {
+            let (p, r) = &rotated[rotation];
+            let passes = refine_dual(p, r, mode, sel, &mut color, &mut alpha, cfg, false);
+            work.refund(charge, passes * n);
+        }
         let err = color.err + alpha.err;
         if err < best.0 {
             best = (
@@ -1380,38 +1810,30 @@ fn visible_search(source: &Block, cfg: &Search) -> (u32, Cand) {
     }
     let alpha_penalty: u32 = px.iter().map(|p| (255 - u32::from(p[3])).pow(2)).sum();
     // RGB-only modes remain eligible when their fixed decoded alpha can pay
-    // its full error. No extra partitions or modes are introduced.
+    // its full error. No extra partitions or modes are introduced. Modes 3
+    // and 1 share one RGB ranking; both rankings come from one table of
+    // texel sums, fixed work like the opaque moment ranking.
+    let table = objective::SumTable::new(px, reps.objective.unwrap());
+    let mut rankings: Option<[[(f32, f32); 64]; 2]> = None;
     for (mode, levels, count) in [
         (7, 4.0, cfg.parts[2]),
         (3, 4.0, cfg.parts[0]),
         (1, 8.0, cfg.parts[1]),
     ] {
         let penalty = if mode == 7 { 0 } else { alpha_penalty };
-        if penalty >= best.0 {
+        if penalty >= best.0 || count == 0 {
             continue;
         }
-        let estimates = core::array::from_fn(|p| {
-            let mask = MASKS2[p][0];
-            let a = reps.masked(!mask);
-            let b = reps.masked(mask);
-            let (a, b) = if mode == 7 {
-                (
-                    objective::estimate::<0, 4>(px, &a),
-                    objective::estimate::<0, 4>(px, &b),
-                )
-            } else {
-                (
-                    objective::estimate::<0, 3>(px, &a),
-                    objective::estimate::<0, 3>(px, &b),
-                )
-            };
-            (a.0 + b.0, a.1 + b.1)
-        });
+        let estimates = rankings.get_or_insert_with(|| table.rankings())[usize::from(mode == 7)];
         let mut kept = None;
         let mut limit = best.0.saturating_add(best.0 / 4) - penalty;
         for &(_, partition) in &best_partitions(&estimates, levels, count)[..count] {
             let mask = MASKS2[partition][0];
             let r = [reps.masked(!mask), reps.masked(mask)];
+            let k = lens(&[!mask, mask]);
+            if !work.take(axis_work(k) + rough_work(k, cfg.rough_iters)) {
+                break;
+            }
             let s = r.map(|r| {
                 let t = if mode == 7 {
                     axis_targets::<0, 4>(px, &r)
@@ -1428,8 +1850,14 @@ fn visible_search(source: &Block, cfg: &Search) -> (u32, Cand) {
         }
         if let Some((partition, mut s)) = kept {
             let mask = MASKS2[partition][0];
-            for (k, mask) in [!mask, mask].into_iter().enumerate() {
-                refine_subset(px, mode, &reps.masked(mask), &mut s[k], false, cfg);
+            let charge = refine_work(mode, lens(&[!mask, mask]), cfg, false);
+            if work.take(charge) {
+                let mut used = 0;
+                for (k, mask) in [!mask, mask].into_iter().enumerate() {
+                    let r = reps.masked(mask);
+                    used += r.len as u32 * refine_subset(px, mode, &r, &mut s[k], false, cfg);
+                }
+                work.refund(charge, used);
             }
             let err = s[0].err + s[1].err + penalty;
             if err < best.0 {
@@ -1437,29 +1865,17 @@ fn visible_search(source: &Block, cfg: &Search) -> (u32, Cand) {
             }
         }
     }
-    for (mode, levels, count, ranked) in [(0, 8.0, cfg.parts3[0], 16), (2, 4.0, cfg.parts3[1], 64)]
-    {
-        if count == 0 || alpha_penalty >= best.0 {
-            continue;
-        }
-        let mut estimates = [(f32::MAX, 0.0); 64];
-        for (partition, e) in estimates.iter_mut().enumerate().take(ranked) {
-            *e = (0.0, 0.0);
-            for mask in masks3(partition) {
-                let (res, var) = objective::estimate::<0, 3>(px, &reps.masked(mask));
-                e.0 += res;
-                e.1 += var;
+    let count = cfg.parts3;
+    if count > 0 && alpha_penalty < best.0 {
+        let estimates = table.rankings3(16, masks3);
+        let mut kept: Option<RankedThree> = None;
+        for &(_, partition) in &best_partitions(&estimates, 8.0, count)[..count] {
+            let k = lens(&masks3(partition));
+            if !work.take(axis_work(k) + rough_work(k, cfg.rough_iters)) {
+                break;
             }
-        }
-        let mut kept: Option<(u32, usize, [Fit; 3])> = None;
-        for &(_, partition) in &best_partitions(&estimates, levels, count)[..count] {
             let s = masks3(partition).map(|mask| {
-                let r = reps.masked(mask);
-                if mode == 0 {
-                    fit::<0, 3>(px, &r, P0, &L3, cfg.rough_iters, 0, false)
-                } else {
-                    fit::<0, 3>(px, &r, P2, &L2, cfg.rough_iters, 0, false)
-                }
+                fit::<0, 3>(px, &reps.masked(mask), P0, &L3, cfg.rough_iters, 0, false)
             });
             let err = s.iter().map(|s| s.err).sum::<u32>() + alpha_penalty;
             if kept.is_none_or(|k| err < k.0) {
@@ -1467,12 +1883,18 @@ fn visible_search(source: &Block, cfg: &Search) -> (u32, Cand) {
             }
         }
         if let Some((_, partition, mut s)) = kept {
-            for (k, mask) in masks3(partition).into_iter().enumerate() {
-                refine_subset(px, mode, &reps.masked(mask), &mut s[k], false, cfg);
+            let charge = refine_work(0, lens(&masks3(partition)), cfg, false);
+            if work.take(charge) {
+                let mut used = 0;
+                for (k, mask) in masks3(partition).into_iter().enumerate() {
+                    let r = reps.masked(mask);
+                    used += r.len as u32 * refine_subset(px, 0, &r, &mut s[k], false, cfg);
+                }
+                work.refund(charge, used);
             }
             let err = s.iter().map(|s| s.err).sum::<u32>() + alpha_penalty;
             if err < best.0 {
-                best = (err, Cand::Three { mode, partition, s });
+                best = (err, Cand::Three { partition, s });
             }
         }
     }
@@ -1531,6 +1953,7 @@ mod tests {
                 visible: 0xeeee,
                 alpha: 3,
                 alpha_weight: weight,
+                colour_weight: 1,
             });
             for rotation in 0..4 {
                 let map = dual_map(rotation, false);
@@ -1590,28 +2013,23 @@ mod tests {
             visible: 0xeeee,
             alpha: 3,
             alpha_weight: 4,
+            colour_weight: 4,
         });
         let alpha_penalty: u32 = 4 * px
             .iter()
             .map(|p| (255 - u32::from(p[3])).pow(2))
             .sum::<u32>();
-        for mode in [0, 1, 2, 3, 7] {
+        for mode in [0, 1, 3, 7] {
             for partition in 0..if mode == 0 { 16 } else { 64 } {
-                let (err, block) = if mode == 0 || mode == 2 {
-                    let mut s = masks3(partition).map(|m| {
-                        let r = reps.masked(m);
-                        if mode == 0 {
-                            fit::<0, 3>(&px, &r, P0, &L3, 1, 0, false)
-                        } else {
-                            fit::<0, 3>(&px, &r, P2, &L2, 1, 0, false)
-                        }
-                    });
+                let (err, block) = if mode == 0 {
+                    let mut s = masks3(partition)
+                        .map(|m| fit::<0, 3>(&px, &reps.masked(m), P0, &L3, 1, 0, false));
                     for (k, m) in masks3(partition).into_iter().enumerate() {
                         refine_subset(&px, mode, &reps.masked(m), &mut s[k], false, &QUALITY);
                     }
                     (
                         s.iter().map(|f| f.err).sum::<u32>() + alpha_penalty,
-                        pack3(mode, partition, s),
+                        pack3(partition, s),
                     )
                 } else {
                     let m = MASKS2[partition][0];
@@ -1657,8 +2075,8 @@ mod tests {
                     assert!(cfg.mode4_iters <= ceiling.mode4_iters);
                     for k in 0..2 {
                         assert!(cfg.duals[k] <= ceiling.duals[k]);
-                        assert!(cfg.parts3[k] <= ceiling.parts3[k]);
                     }
+                    assert!(cfg.parts3 <= ceiling.parts3);
                     for k in 0..3 {
                         assert!(cfg.parts[k] <= ceiling.parts[k]);
                     }
@@ -1701,6 +2119,14 @@ mod tests {
             let rgba = Partitions::new::<4>(&px);
             assert_eq!(rgb.est, partition_estimates::<3>(&px));
             assert_eq!(rgba.est, partition_estimates::<4>(&px));
+            let counts = [1 + case % 4, 1 + case / 4 % 8];
+            assert_eq!(
+                best_partitions_31(&rgb.est, counts),
+                [
+                    best_partitions(&rgb.est, 4.0, counts[0]),
+                    best_partitions(&rgb.est, 8.0, counts[1])
+                ]
+            );
             for p in 0..64 {
                 let mask = MASKS2[p][0];
                 let r = [reps.masked(!mask), reps.masked(mask)];
@@ -1900,20 +2326,14 @@ mod tests {
                 assert_eq!(u64::from(err), sse, "case {case}");
                 assert!(!opaque || alpha_kept, "case {case}");
             }
-            for mode in [0, 2] {
-                let partition = case % if mode == 0 { 16 } else { 64 };
-                let mut s = fit_partition3(&px, mode, partition, 1, 0);
+            {
+                let partition = case % 16;
+                let all = Reps::distinct(&px);
+                let mut s = fit_partition3(&px, &all, partition, 1, 0);
                 for (k, mask) in masks3(partition).into_iter().enumerate() {
-                    refine_subset(
-                        &px,
-                        mode,
-                        &Reps::distinct(&px).masked(mask),
-                        &mut s[k],
-                        true,
-                        &QUALITY,
-                    );
+                    refine_subset(&px, 0, &all.masked(mask), &mut s[k], true, &QUALITY);
                 }
-                let (sse, _) = decoded(&px, &pack3(mode, partition, s));
+                let (sse, _) = decoded(&px, &pack3(partition, s));
                 let alpha_err: u64 = px.iter().map(|p| (255 - u64::from(p[3])).pow(2)).sum();
                 assert_eq!(
                     u64::from(s[0].err + s[1].err + s[2].err) + alpha_err,

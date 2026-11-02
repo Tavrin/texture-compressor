@@ -120,12 +120,13 @@ fn main() {
             println!();
         }
     }
-    // Synthetic cases selected by deterministic search cover every BC7 mode.
-    // Retain the earlier three-colour inputs, now selected as mode 2, and add
-    // a mode 0 case to keep every packer in the native/wasm comparison.
+    // Synthetic cases selected by deterministic search cover every BC7 mode
+    // a preset emits, keeping each of those packers in the native/wasm
+    // comparison. No preset searches mode 2, so the earlier three-colour
+    // inputs are now selected as mode 0.
     let bc7_modes: [(u32, Effort, [u8; 64]); 10] = [
         (
-            2,
+            0,
             Effort::Quality,
             [
                 85, 132, 186, 255, 231, 222, 42, 255, 221, 212, 32, 255, 207, 198, 18, 255, 224,
@@ -145,7 +146,7 @@ fn main() {
             ],
         ),
         (
-            2,
+            0,
             Effort::Quality,
             [
                 198, 171, 174, 255, 46, 87, 147, 255, 198, 171, 174, 255, 143, 62, 23, 255, 46, 87,
@@ -205,7 +206,7 @@ fn main() {
             ],
         ),
         (
-            2,
+            4,
             Effort::Quality,
             [
                 137, 198, 149, 255, 141, 131, 168, 255, 138, 197, 149, 255, 102, 255, 178, 255,
@@ -240,7 +241,7 @@ fn main() {
         println!();
     }
 
-    assert_eq!(covered_modes, u8::MAX);
+    assert_eq!(covered_modes, !(1u8 << 2));
 
     // A larger deterministic BC7 fixture mixes gradients, partitions,
     // constants, grayscale, and independent alpha within the same image.

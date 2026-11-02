@@ -125,7 +125,14 @@ On other measured sets:
   0.03 dB.
   There is no BC6H speed claim: Intel is faster at every preset.
 
-BC1, BC3 and BC7, at all presets, are provided without performance claims.
+- BC7 Quality, on a separate sealed set of 40 CC0 textures, encodes in 0.99x
+  the single-thread wall time of Intel ISPC's basic preset (pooled; worst
+  texture 1.10x), with no texture losing more than 0.1 dB PSNR or 0.001 SSIM
+  against Intel on visible texels.
+
+BC7 Balanced is faster than Intel's basic preset on the same set (0.79x
+pooled, worst texture 0.89x), but loses 0.66 dB on one fence texture, so it
+carries no claim. BC1, BC3 and BC7 Fast are provided without performance claims.
 BC4 and BC5 Fast and Quality are provided without performance claims.
 
 ## How claims are measured
