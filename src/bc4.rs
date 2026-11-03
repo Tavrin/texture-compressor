@@ -341,6 +341,23 @@ pub(crate) const NARROW_SELECTORS: [[u8; 8]; 8] = [
 
 pub(crate) const RANGE_BOUND_OFFSETS: [[u8; 7]; 256] = range_bound_offsets();
 
+// The same offsets padded to eight bytes, so a vector kernel loads one row
+// with a single in-bounds eight-byte load.
+#[cfg(all(feature = "simd", feature = "std", target_arch = "x86_64"))]
+pub(crate) const RANGE_BOUND_VECTORS: [[u8; 8]; 256] = {
+    let mut table = [[0; 8]; 256];
+    let mut span = 0;
+    while span < 256 {
+        let mut i = 0;
+        while i < 7 {
+            table[span][i] = RANGE_BOUND_OFFSETS[span][i];
+            i += 1;
+        }
+        span += 1;
+    }
+    table
+};
+
 const fn range_bound_offsets() -> [[u8; 7]; 256] {
     let mut table = [[0; 7]; 256];
     let weights = [9363u32, 18724, 28086, 37450, 46812, 56173];

@@ -28,6 +28,17 @@
   Balanced and Quality output byte for byte, as an explicit opt-in for
   premultiplied input or cutouts whose transparent texels are never filtered.
   Other formats reject it with `Error::UnsupportedPolicy`.
+### Changed
+
+- BC5 `PeakBounded` Fast and Balanced on x86_64 (SSE4.1) now encodes each block
+  row in one vector kernel that deinterleaves R and G with byte shuffles
+  straight into registers. The previous per-block gather wrote 16 single bytes
+  and reloaded them as one vector, which stalled on store forwarding, and the
+  per-block call did not inline in builds with several codegen units. Output
+  bytes are unchanged. On 28 consumer textures (single pinned core, RG8 packed
+  inside the timed span for both encoders) the pooled time against Intel ISPC
+  went from 2.0x to 0.78x with codegen-units = 16, and from 1.6x to 0.79x with
+  codegen-units = 1.
 
 ## [0.2.1] - 2026-11-03
 
