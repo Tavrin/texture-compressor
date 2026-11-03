@@ -18,11 +18,19 @@ mod wasm;
 static LEVEL: AtomicU8 = AtomicU8::new(255);
 // 0 scalar, 1 SSE4.1, 2 AVX2, 3 NEON, 4 wasm simd128. No mutable
 // diagnostic override: selection is immutable for the process and its workers.
+// Inlined into every dispatching caller; detection runs once, out of line.
+#[inline]
 fn level() -> u8 {
     let cached = LEVEL.load(Ordering::Relaxed);
     if cached != 255 {
         return cached;
     }
+    detect_level()
+}
+
+#[cold]
+#[inline(never)]
+fn detect_level() -> u8 {
     #[allow(unused_mut)]
     let mut detected = detect();
     #[cfg(feature = "simd-diagnostics")]
@@ -89,6 +97,7 @@ pub(super) fn seed_batch(blocks: &[Block; 8]) -> Option<[Fit; 8]> {
     let _ = blocks;
     dispatch!(level(), seed, blocks)
 }
+#[inline]
 pub(super) fn select<const C0: usize, const C1: usize>(
     px: &Block,
     reps: &Reps,
@@ -211,6 +220,53 @@ fn level_tables(n: usize) -> (&'static [i32; 16], &'static [u8; 16]) {
     };
     (&WEIGHTS[slot], &THRESHOLDS[slot])
 }
+// The weights as bytes (each is at most 64), padded to 16 entries.
+const fn weight_bytes<const N: usize>(w: [i32; N]) -> [u8; 16] {
+    let mut out = [0; 16];
+    let mut j = 0;
+    while j < N {
+        out[j] = w[j] as u8;
+        j += 1;
+    }
+    out
+}
+static WEIGHT_BYTES: [[u8; 16]; 3] = [weight_bytes(W2), weight_bytes(W3), weight_bytes(W4)];
+
+/// The integer sums of a least-squares endpoint solve (see `least_squares`).
+#[cfg_attr(
+    not(any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    )),
+    allow(dead_code)
+)]
+pub(super) struct LsSums {
+    pub(super) aa: i32,
+    pub(super) ab: i32,
+    pub(super) bb: i32,
+    pub(super) ax: [i32; 4],
+    pub(super) bx: [i32; 4],
+}
+
+/// `least_squares` sums for the selectors `idx` on `lv`; `None` on the
+/// scalar backend.
+#[inline]
+pub(super) fn ls_sums<const C0: usize, const C1: usize>(
+    px: &Block,
+    reps: &Reps,
+    idx: &[u8; 16],
+    lv: &Levels,
+) -> Option<LsSums> {
+    let weights = &WEIGHT_BYTES[match lv.w.len() {
+        4 => 0,
+        8 => 1,
+        _ => 2,
+    }];
+    let _ = (&px, &reps, &idx, &weights);
+    dispatch!(level(), ls_sums::<C0, C1>, px, reps, idx, weights)
+}
 // Visibility bit i of a u16 mask, split by byte: bit i of the low byte for
 // texels 0..8 and of the high byte for texels 8..16.
 #[cfg_attr(
@@ -233,6 +289,7 @@ static VISIBLE_LOW: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 0, 0, 0, 0, 0, 0, 0
     allow(dead_code)
 )]
 static VISIBLE_HIGH: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 4, 8, 16, 32, 64, 128];
+#[inline]
 pub(super) fn polish<const C0: usize, const C1: usize>(
     px: &Block,
     reps: &Reps,
@@ -278,6 +335,35 @@ pub(super) fn partition_estimates<const CH: usize>(
         for l in 0..width {
             out[base + l] = (a[l].0 + b[l].0, a[l].1 + b[l].1);
         }
+    }
+    true
+}
+
+/// `subset_estimate::<CH>` of each of the first `count` subset moments, in
+/// place in `out`; `false` (with `out` unspecified) on the scalar backend.
+/// Every batch reads eight lanes, so `N` must exceed `count` by at least
+/// four (by eight when `count` is not a multiple of four).
+pub(super) fn subset_estimates<const CH: usize, const N: usize>(
+    out: &mut [(f32, f32); N],
+    moments: &[Moments; N],
+    count: usize,
+) -> bool {
+    let selected = level();
+    if selected == 0 {
+        return false;
+    }
+    let width = if selected == 2 { 8 } else { 4 };
+    for base in (0..count).step_by(width) {
+        let Some(m) = moments[base..].first_chunk::<8>() else {
+            return false;
+        };
+        let _ = &m;
+        let e: Option<[(f32, f32); 8]> = dispatch!(selected, estimates::<CH>, m);
+        let Some(e) = e else {
+            return false;
+        };
+        let lanes = width.min(count - base);
+        out[base..base + lanes].copy_from_slice(&e[..lanes]);
     }
     true
 }
@@ -470,6 +556,34 @@ mod tests {
                                 assert_eq!(scalar, vector);
                             }
                         }
+                    }
+                    // Least-squares sums equal their scalar loop.
+                    for (slot, lv) in [&L2, &L3, &L4].into_iter().enumerate() {
+                        let idx: [u8; 16] =
+                            core::array::from_fn(|i| ((i * 7 + trial) % lv.w.len()) as u8);
+                        let s = dispatch!(
+                            backend,
+                            ls_sums::<C0, CH>,
+                            px,
+                            &reps,
+                            &idx,
+                            &WEIGHT_BYTES[slot]
+                        )
+                        .unwrap();
+                        let (mut aa, mut ab, mut bb) = (0, 0, 0);
+                        let (mut ax, mut bx) = ([0i32; 4], [0i32; 4]);
+                        for (i, n) in reps.iter() {
+                            let b = lv.w[usize::from(idx[i])];
+                            let a = 64 - b;
+                            aa += a * a * n;
+                            ab += a * b * n;
+                            bb += b * b * n;
+                            for c in 0..3 {
+                                ax[c] += a * i32::from(px[i][c]) * n;
+                                bx[c] += b * i32::from(px[i][c]) * n;
+                            }
+                        }
+                        assert_eq!((s.aa, s.ab, s.bb, s.ax, s.bx), (aa, ab, bb, ax, bx));
                     }
                 }
                 for px in &blocks {

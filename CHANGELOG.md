@@ -4,6 +4,20 @@
 
 ### Changed
 
+- BC7 Balanced and Quality encode opaque blocks faster: the least-squares
+  sums and the three-subset partition estimates use the SSE4.1, AVX2, NEON and wasm simd128 kernels; selector
+  batches below the error cutoff are added at once; subset representatives
+  come from a byte table; and the dispatch helpers are inlined, so builds
+  with many codegen units keep the hot calls direct. These steps produce
+  the same bytes as before.
+- BC7 Balanced and Quality take a second look at opaque blocks whose best
+  candidate has a channel error of 10 or more: every rough candidate of the
+  search that was not refined is ranked by its largest channel error, and
+  the two lowest are refined. One of them replaces the winner when its largest channel error
+  is lower and its squared error is at most a quarter higher. This lowers
+  texture-wide maximum errors on a few textures. Balanced and Quality
+  output bytes change on opaque blocks; Fast is unchanged.
+
 - BC7 Balanced and Quality encode blocks with transparent texels faster:
   the weighted search shares its per-texel sums across colour channels and
   ranks partitions with SSE4.1, AVX2, NEON and wasm simd128 kernels. Output
