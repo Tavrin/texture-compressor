@@ -714,8 +714,18 @@ fn range_channel_sse41(values: &[u8; 16]) -> [u8; 8] {
     use core::arch::x86_64::*;
     // SAFETY: the source is a fixed sixteen-byte array and both target
     // features were established by the checked capability below.
-    let (min, max) = unsafe {
-        let v = _mm_loadu_si128(values.as_ptr().cast());
+    let v = unsafe { _mm_loadu_si128(values.as_ptr().cast()) };
+    fit_sse41(v).to_le_bytes()
+}
+
+// Fits one channel held in a register: endpoints in the low two bytes, then
+// the 48 selector bits. The register never round-trips through memory.
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[target_feature(enable = "ssse3,sse4.1")]
+#[inline]
+fn fit_sse41(v: core::arch::x86_64::__m128i) -> u64 {
+    use core::arch::x86_64::*;
+    let (min, max) = {
         let upper = _mm_srli_si128::<8>(v);
         let lo = _mm_cvtepu8_epi16(_mm_min_epu8(v, upper));
         let hi = _mm_cvtepu8_epi16(_mm_xor_si128(_mm_max_epu8(v, upper), _mm_set1_epi8(-1)));
@@ -724,10 +734,9 @@ fn range_channel_sse41(values: &[u8; 16]) -> [u8; 8] {
         (min, 255 - inverse_max)
     };
     let span = usize::from(max - min);
-    // SAFETY: fixed-array extents permit the 16-byte source load, eight-byte
-    // table loads and sixteen-byte packed-word store. All lookup is in registers.
+    // SAFETY: fixed-array extents permit the eight-byte table loads.
+    // All lookup is in registers.
     unsafe {
-        let v = _mm_loadu_si128(values.as_ptr().cast());
         let minimum = _mm_set1_epi8(i8::from_ne_bytes([min]));
         let selectors = if span <= 7 {
             let table = &crate::bc4::NARROW_SELECTORS[span];
@@ -736,8 +745,7 @@ fn range_channel_sse41(values: &[u8; 16]) -> [u8; 8] {
                 _mm_sub_epi8(v, minimum),
             )
         } else {
-            let t = &crate::bc4::RANGE_BOUND_OFFSETS[span];
-            let offsets = [t[0], t[1], t[2], t[3], t[4], t[5], t[6], 0];
+            let offsets = &crate::bc4::RANGE_BOUND_VECTORS[span];
             let one = _mm_set1_epi8(1);
             let sign = _mm_set1_epi8(i8::MIN);
             let x = _mm_xor_si128(v, sign);
@@ -758,12 +766,74 @@ fn range_channel_sse41(values: &[u8; 16]) -> [u8; 8] {
         packed = _mm_and_si128(packed, _mm_set1_epi64x(0x0000_0fff_0000_0fff));
         packed = _mm_or_si128(packed, _mm_srli_epi64::<20>(packed));
         packed = _mm_and_si128(packed, _mm_set1_epi64x(0x00ff_ffff));
-        let mut words = [0u64; 2];
-        _mm_storeu_si128(words.as_mut_ptr().cast(), packed);
-        let bits = (words[0] | (words[1] << 24)).to_le_bytes();
-        [
-            max, min, bits[0], bits[1], bits[2], bits[3], bits[4], bits[5],
-        ]
+        let low = _mm_cvtsi128_si64(packed).cast_unsigned();
+        let high = _mm_extract_epi64::<1>(packed).cast_unsigned();
+        u64::from(max) | (u64::from(min) << 8) | ((low | (high << 24)) << 16)
+    }
+}
+
+// Fits every complete block of one block row in a single feature-enabled
+// frame, deinterleaving R and G with byte shuffles straight into registers.
+// `CHANNELS` is 2 (RG8) or 4 (RGBA8); `rows` are the byte offsets of the four
+// source rows. Output is identical to gathering R and G into arrays and
+// fitting each with `fit_sse41`.
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[target_feature(enable = "ssse3,sse4.1")]
+fn peak_row_sse41<const CHANNELS: usize>(
+    data: &[u8],
+    rows: [usize; 4],
+    blocks: usize,
+    dst: &mut [u8],
+) {
+    use core::arch::x86_64::*;
+    for (bx, out) in dst
+        .as_chunks_mut::<16>()
+        .0
+        .iter_mut()
+        .take(blocks)
+        .enumerate()
+    {
+        let start = bx * 4 * CHANNELS;
+        let [r0, r1, r2, r3] = rows.map(|row| &data[row + start..row + start + 4 * CHANNELS]);
+        // SAFETY: each source slice holds exactly 4 * CHANNELS bytes, which
+        // covers the 8-byte (RG8) or 16-byte (RGBA8) unaligned load; the
+        // remaining intrinsics are register-only under the enabled features.
+        let (red, green) = unsafe {
+            if CHANNELS == 2 {
+                let split = _mm_setr_epi8(0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15);
+                let rows01 = _mm_shuffle_epi8(
+                    _mm_unpacklo_epi64(
+                        _mm_loadl_epi64(r0.as_ptr().cast()),
+                        _mm_loadl_epi64(r1.as_ptr().cast()),
+                    ),
+                    split,
+                );
+                let rows23 = _mm_shuffle_epi8(
+                    _mm_unpacklo_epi64(
+                        _mm_loadl_epi64(r2.as_ptr().cast()),
+                        _mm_loadl_epi64(r3.as_ptr().cast()),
+                    ),
+                    split,
+                );
+                // Each half is [R row a, R row b | G row a, G row b].
+                (
+                    _mm_unpacklo_epi64(rows01, rows23),
+                    _mm_unpackhi_epi64(rows01, rows23),
+                )
+            } else {
+                let split = _mm_setr_epi8(0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15);
+                let row = |p: &[u8]| _mm_shuffle_epi8(_mm_loadu_si128(p.as_ptr().cast()), split);
+                // Dwords are [R, G, B, A] of four texels in one source row.
+                let rows01 = _mm_unpacklo_epi32(row(r0), row(r1));
+                let rows23 = _mm_unpacklo_epi32(row(r2), row(r3));
+                (
+                    _mm_unpacklo_epi64(rows01, rows23),
+                    _mm_unpackhi_epi64(rows01, rows23),
+                )
+            }
+        };
+        out[..8].copy_from_slice(&fit_sse41(red).to_le_bytes());
+        out[8..].copy_from_slice(&fit_sse41(green).to_le_bytes());
     }
 }
 
@@ -788,5 +858,21 @@ impl Sse41RangeEncoder {
     pub(crate) fn encode(&self, values: &[u8; 16]) -> [u8; 8] {
         // SAFETY: private construction establishes both SSSE3 and SSE4.1.
         unsafe { range_channel_sse41(values) }
+    }
+
+    /// Fits the first `blocks` complete 4x4 blocks of one block row.
+    ///
+    /// `rows` are the byte offsets of the four source rows in `data`, `CHANNELS`
+    /// is 2 (RG8) or 4 (RGBA8), and `dst` receives 16 bytes per block.
+    #[inline]
+    pub(crate) fn encode_row<const CHANNELS: usize>(
+        &self,
+        data: &[u8],
+        rows: [usize; 4],
+        blocks: usize,
+        dst: &mut [u8],
+    ) {
+        // SAFETY: private construction establishes both SSSE3 and SSE4.1.
+        unsafe { peak_row_sse41::<CHANNELS>(data, rows, blocks, dst) }
     }
 }
