@@ -9,7 +9,9 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
 use std::io::Write;
-use texture_compressor::{encode, encode_into, encoded_len, Effort, Format, ImageView, Settings};
+use texture_compressor::{
+    encode, encode_into, encoded_len, AlphaPolicy, Effort, Format, ImageView, Settings,
+};
 
 #[path = "../../tests/bc7_decoder.rs"]
 #[allow(dead_code)]
@@ -32,6 +34,10 @@ fuzz_target!(|data: &[u8]| {
                 2 => Effort::Quality,
                 _ => Effort::Fast,
             };
+            // Bit 2 selects IgnoreTransparentColour; bit 3 zeroes the alpha of
+            // every odd block so all-transparent blocks with colour are common.
+            let policy = policy_of(first >> 2);
+            let zero_odd = first & 8 != 0;
             let blocks = (rest.len() / 64).clamp(1, 6);
             let width = 4 * blocks as u32;
             let mut px = vec![0u8; blocks * 64];
@@ -40,9 +46,12 @@ fuzz_target!(|data: &[u8]| {
                     let (b, o) = (i / 16, i % 16);
                     let at = b * 64 + row * 16 + o;
                     *v = rest.get(at).copied().unwrap_or(0);
+                    if zero_odd && b % 2 == 1 && o % 4 == 3 {
+                        *v = 0;
+                    }
                 }
             }
-            check(data, effort, width, 4, blocks * 16, &px);
+            check(data, effort, policy, width, 4, blocks * 16, &px);
             return;
         }
     }
@@ -54,6 +63,7 @@ fuzz_target!(|data: &[u8]| {
         1 => Effort::Balanced,
         _ => Effort::Quality,
     };
+    let policy = policy_of(mode / 3);
     let width = u32::from(*w) % 23 + 1;
     let height = u32::from(*h) % 23 + 1;
     let stride = width as usize * 4 + usize::from(*slack % 5);
@@ -108,18 +118,66 @@ fuzz_target!(|data: &[u8]| {
             _ => src(c),
         };
     }
-    check(data, effort, width, height, stride, &px);
+    check(data, effort, policy, width, height, stride, &px);
 });
 
-fn check(data: &[u8], effort: Effort, width: u32, height: u32, stride: usize, px: &[u8]) {
+fn policy_of(bits: u8) -> AlphaPolicy {
+    if bits & 1 != 0 {
+        AlphaPolicy::IgnoreTransparentColour
+    } else {
+        AlphaPolicy::Opaque
+    }
+}
+
+fn check(
+    data: &[u8],
+    effort: Effort,
+    policy: AlphaPolicy,
+    width: u32,
+    height: u32,
+    stride: usize,
+    px: &[u8],
+) {
     let view = ImageView::rgba8(px, width, height, stride).unwrap();
-    let settings = Settings::new(Format::Bc7, effort);
+    let settings = Settings::new(Format::Bc7, effort).with_alpha(policy);
     let out = encode(view, &settings).unwrap();
     let len = encoded_len(Format::Bc7, width, height).unwrap();
     assert_eq!(out.len(), len);
     for block in out.chunks_exact(16) {
         assert_ne!(block[0], 0, "reserved BC7 mode");
         let _ = reference::decode(block);
+    }
+    if policy == AlphaPolicy::Opaque {
+        // Straight alpha: colour under zero alpha is scored, so a block whose
+        // fully transparent blocks that carry colour must not decode to black.
+        let bw = (width as usize).div_ceil(4);
+        for (blk, block) in out.chunks_exact(16).enumerate() {
+            let decoded = reference::decode(block);
+            let (bx, by) = (blk % bw, blk / bw);
+            // Only entirely transparent blocks are checked: in a mixed block the
+            // objective may trade a few transparent texels' colour for visible
+            // texels. Four or more visibly coloured texels (a channel of 16 or
+            // more) leave no such trade, so decoding all of them black would be
+            // the ignore-transparent-colour behaviour under the default policy.
+            let (mut texels, mut coloured, mut transparent, mut decoded_colour) = (0, 0, 0, false);
+            for (i, d) in decoded.iter().enumerate() {
+                let (x, y) = (bx * 4 + i % 4, by * 4 + i / 4);
+                if x >= width as usize || y >= height as usize {
+                    continue;
+                }
+                let at = y * stride + x * 4;
+                texels += 1;
+                if px[at + 3] == 0 {
+                    transparent += 1;
+                    coloured += usize::from(px[at..at + 3].iter().any(|&c| c >= 16));
+                    decoded_colour |= d[..3].iter().any(|&c| c != 0);
+                }
+            }
+            assert!(
+                !(transparent == texels && coloured >= 4 && !decoded_colour),
+                "block {blk} effort {effort:?}: colour under zero alpha decoded to black"
+            );
+        }
     }
     let mut into = vec![0u8; len];
     encode_into(view, &settings, &mut into).unwrap();
@@ -134,7 +192,11 @@ fn check(data: &[u8], effort: Effort, width: u32, height: u32, stride: usize, px
         assert_eq!(&out[..16], &single[..], "block differs alone vs in image");
     }
     if let Ok(path) = std::env::var("BC7_DIGEST_LOG") {
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
             let _ = writeln!(f, "{:016x} {:016x}", fnv(data), fnv(&out));
         }
     }

@@ -3,6 +3,7 @@
 //! exceeds that of the range fit (PeakBounded Balanced keeps the range fit).
 #![no_main]
 use libfuzzer_sys::fuzz_target;
+use std::io::Write;
 use texture_compressor::{encode, Bc45Fit, Effort, Format, ImageView, Settings};
 
 /// Reference BC4 palette: interpolants are rounded to nearest, as in the
@@ -48,7 +49,9 @@ fuzz_target!(|data: &[u8]| {
     } else {
         Format::Bc5
     };
-    let width = u32::from(*w) % 23 + 1;
+    // Up to 67 texels wide so rows of 1 to 17 blocks reach every remainder of
+    // the SSE4.1 row kernel's block count.
+    let width = u32::from(*w) % 67 + 1;
     let height = u32::from(*h) % 23 + 1;
     let stride = width as usize * channels + usize::from(*slack % 5);
     let count = (height as usize - 1) * stride + width as usize * channels;
@@ -77,6 +80,24 @@ fuzz_target!(|data: &[u8]| {
     .unwrap();
     // Plain presets must stay encodable on the same input.
     encode(view, &Settings::new(format, effort)).unwrap();
+    // With `BC5_DIGEST_LOG=<file>` each input's PeakBounded output digest is
+    // appended, so a replay under `TEXENC_SIMD=scalar` can be compared byte for
+    // byte against a replay under the dispatched backend (the override is
+    // fixed per process, so the two backends cannot run in one process).
+    if let Ok(path) = std::env::var("BC5_DIGEST_LOG") {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let fnv = |bytes: &[u8]| {
+                bytes.iter().fold(0xcbf29ce484222325u64, |h, &b| {
+                    (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
+                })
+            };
+            let _ = writeln!(f, "{:016x} {:016x}", fnv(data), fnv(&out));
+        }
+    }
     let per = if format == Format::Bc4 { 8 } else { 16 };
     let bw = (width as usize).div_ceil(4);
     for (blk, (mine, base)) in out

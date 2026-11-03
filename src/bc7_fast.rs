@@ -1164,7 +1164,12 @@ pub(super) fn encode(px: &Block) -> [u8; 16] {
 }
 
 #[cfg(feature = "simd")]
-pub(super) fn encode_batch(blocks: &[Block; 8], out: &mut [u8], effort: crate::Effort) {
+pub(super) fn encode_batch(
+    blocks: &[Block; 8],
+    out: &mut [u8],
+    effort: crate::Effort,
+    hide_transparent: bool,
+) {
     // Solid blocks return before using a seed, and nonopaque blocks use
     // the separate visibility-aware fit. Avoid work for batches where no
     // live block can consume the opaque seed.
@@ -1177,14 +1182,15 @@ pub(super) fn encode_batch(blocks: &[Block; 8], out: &mut [u8], effort: crate::E
         None
     };
     let cfg = if effort == crate::Effort::Balanced {
-        &BALANCED
+        BALANCED
     } else {
-        &QUALITY
-    };
+        QUALITY
+    }
+    .hiding_transparent(hide_transparent);
     for (slot, dst) in out.as_chunks_mut::<16>().0.iter_mut().enumerate() {
         dst.copy_from_slice(&search::encode_seeded(
             &blocks[slot],
-            cfg,
+            &cfg,
             seeds.as_ref().map(|t| t[slot]),
         ));
     }

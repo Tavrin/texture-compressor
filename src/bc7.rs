@@ -1,5 +1,5 @@
 //! Experimental scalar BC7 encoding. Format: Microsoft BC7 mode reference.
-use crate::Effort;
+use crate::{AlphaPolicy, Effort};
 
 #[path = "bc7_fast.rs"]
 mod fast;
@@ -1000,11 +1000,14 @@ fn rank_moments(
     score as u64
 }
 
-pub(crate) fn encode(pixels: &[[u8; 4]; 16], effort: Effort) -> [u8; 16] {
+/// Encode one block. Only [`AlphaPolicy::IgnoreTransparentColour`] changes
+/// the scored texels; every other policy scores straight RGBA on all texels.
+pub(crate) fn encode(pixels: &[[u8; 4]; 16], effort: Effort, alpha: AlphaPolicy) -> [u8; 16] {
+    let hide = alpha == AlphaPolicy::IgnoreTransparentColour;
     match effort {
         Effort::Fast => fast::encode(pixels),
-        Effort::Balanced => fast::encode_with(pixels, &fast::BALANCED),
-        Effort::Quality => fast::encode_with(pixels, &fast::QUALITY),
+        Effort::Balanced => fast::encode_with(pixels, &fast::BALANCED.hiding_transparent(hide)),
+        Effort::Quality => fast::encode_with(pixels, &fast::QUALITY.hiding_transparent(hide)),
     }
 }
 
@@ -1013,8 +1016,18 @@ pub(crate) fn batch_width() -> usize {
     fast::batch_width()
 }
 #[cfg(feature = "simd")]
-pub(crate) fn encode_batch(blocks: &[[[u8; 4]; 16]; 8], out: &mut [u8], effort: Effort) {
-    fast::encode_batch(blocks, out, effort);
+pub(crate) fn encode_batch(
+    blocks: &[[[u8; 4]; 16]; 8],
+    out: &mut [u8],
+    effort: Effort,
+    alpha: AlphaPolicy,
+) {
+    fast::encode_batch(
+        blocks,
+        out,
+        effort,
+        alpha == AlphaPolicy::IgnoreTransparentColour,
+    );
 }
 
 #[cfg(feature = "simd")]
@@ -1078,7 +1091,7 @@ mod partition_tests {
                 assert_eq!(independent_decoder::decode(&block), [p; 16]);
                 for effort in [Effort::Fast, Effort::Balanced, Effort::Quality] {
                     assert_eq!(
-                        independent_decoder::decode(&encode(&[p; 16], effort)),
+                        independent_decoder::decode(&encode(&[p; 16], effort, AlphaPolicy::Opaque)),
                         [p; 16]
                     );
                 }
@@ -1193,7 +1206,7 @@ mod partition_tests {
                 for block in [
                     mode6(&pixels, effort).0,
                     partition_mode(&pixels, 7, effort).0,
-                    encode(&pixels, effort),
+                    encode(&pixels, effort, AlphaPolicy::Opaque),
                 ] {
                     let decoded = independent_decoder::decode(&block);
                     assert!(

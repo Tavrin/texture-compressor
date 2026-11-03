@@ -256,8 +256,14 @@ fn parallel_matches_serial_across_shapes_and_pools() {
                 for alpha in [
                     AlphaPolicy::Opaque,
                     AlphaPolicy::PunchThrough { threshold: 128 },
+                    AlphaPolicy::IgnoreTransparentColour,
                 ] {
-                    if format != Format::Bc1 && alpha != AlphaPolicy::Opaque {
+                    let supported = match alpha {
+                        AlphaPolicy::PunchThrough { .. } => format == Format::Bc1,
+                        AlphaPolicy::IgnoreTransparentColour => format == Format::Bc7,
+                        _ => true,
+                    };
+                    if !supported {
                         continue;
                     }
                     let settings = Settings::new(format, effort).with_alpha(alpha);
@@ -537,6 +543,45 @@ fn bc7_roundtrip_and_validation() {
         &Settings::new(Format::Bc7, Effort::Fast)
     )
     .is_err());
+}
+
+// Straight alpha is the default: colour under zero alpha is encoded like any
+// other colour. Only the explicit BC7 policy may discard it.
+#[test]
+fn bc7_straight_alpha_keeps_colour_under_zero_alpha() {
+    let texels: [[u8; 4]; 16] = core::array::from_fn(|i| {
+        let v = (i * 5) as u8;
+        [219 - v, 190 - v, 160 + v, if i % 3 == 0 { 255 } else { 0 }]
+    });
+    let data = texels.as_flattened();
+    let image = ImageView::rgba8(data, 4, 4, 16).unwrap();
+    for effort in [Effort::Fast, Effort::Balanced, Effort::Quality] {
+        let straight = Settings::new(Format::Bc7, effort);
+        let decoded = bc7_decoder::decode(&encode(image, &straight).unwrap());
+        for (src, d) in texels.iter().zip(decoded) {
+            for c in 0..4 {
+                // Discarded colour would decode about 160 levels away.
+                assert!(src[c].abs_diff(d[c]) <= 16, "{effort:?} {src:?} {d:?}");
+            }
+        }
+        let ignore =
+            Settings::new(Format::Bc7, effort).with_alpha(AlphaPolicy::IgnoreTransparentColour);
+        let decoded = bc7_decoder::decode(&encode(image, &ignore).unwrap());
+        for (src, d) in texels.iter().zip(decoded) {
+            let channels = if src[3] == 0 { 3..4 } else { 0..4 };
+            for c in channels {
+                assert!(src[c].abs_diff(d[c]) <= 16, "{effort:?} {src:?} {d:?}");
+            }
+        }
+    }
+    for format in [Format::Bc1, Format::Bc3, Format::Bc4, Format::Bc5] {
+        let settings =
+            Settings::new(format, Effort::Fast).with_alpha(AlphaPolicy::IgnoreTransparentColour);
+        assert_eq!(
+            encode(image, &settings),
+            Err(texture_compressor::Error::UnsupportedPolicy)
+        );
+    }
 }
 
 #[test]
