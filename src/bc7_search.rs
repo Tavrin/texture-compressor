@@ -351,7 +351,10 @@ fn peak_choice(px: &Block, best: (u32, Cand), finalists: &Finalists) -> (u32, Ca
             continue;
         }
         let p = cand.peak(px);
-        if p + PEAK_GAIN <= peak && (p, err) < (pick.0, pick.1 .0) {
+        // `peak - p >= PEAK_GAIN` without u8 overflow when p is 255.
+        if peak.checked_sub(p).is_some_and(|gain| gain >= PEAK_GAIN)
+            && (p, err) < (pick.0, pick.1 .0)
+        {
             pick = (p, (err, cand));
         }
     }
@@ -2080,6 +2083,23 @@ mod tests {
                 assert_eq!(a.1.pack(), b.1.pack());
             }
         }
+    }
+
+    #[test]
+    fn peak_choice_accepts_a_peak_error_of_255() {
+        // An all-black block decodes exactly; one texel of 255 then gives the
+        // best candidate and its finalist a peak of 255, where `peak + gain`
+        // overflowed a u8.
+        let black: Block = [[0, 0, 0, 255]; 16];
+        let (_, cand) = search(&black, &BALANCED);
+        let mut px = black;
+        px[0][0] = 255;
+        assert_eq!(cand.peak(&px), 255);
+        let mut finalists: Finalists = [None; 8];
+        finalists[0] = Some((1000, cand));
+        let (err, picked) = peak_choice(&px, (1000, cand), &finalists);
+        assert_eq!(err, 1000);
+        assert_eq!(picked.pack(), cand.pack());
     }
 
     #[test]

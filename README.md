@@ -223,6 +223,48 @@ found no panic, overflow, out-of-bounds access or violated check on x86_64. It
 does not cover NEON or WebAssembly code paths, other CPUs' dispatch choices,
 or images larger than 23x23 texels.
 
+#### 0.2.2 additions (BC5 row kernel, BC7 straight alpha)
+
+`bc5_peak` now takes images up to 67 texels wide (rows of 1 to 17 blocks, so
+every remainder of the SSE4.1 `PeakBounded` row kernel) and, with
+`BC5_DIGEST_LOG=<file>`, logs input and output digests like `bc7_encode`.
+`bc7_encode` now also picks `AlphaPolicy::IgnoreTransparentColour` (raw layout
+bit 2; structured mode byte divided by three), can zero the alpha of every odd
+block (raw layout bit 3), and under the default policy asserts that a fully
+transparent block with at least four texels of visible colour (a channel of 16
+or more) does not decode to black. A first version of that assertion covered
+any zero-alpha texel with any colour and fired on legitimate output (a texel of
+(1, 0, 0), then one of (46, 16, 0) in a block of mostly visible texels, where
+the objective may trade that texel); it was narrowed to the case above.
+
+Seeds: about 300 BC7 and 250 BC5 inputs cut from 41 development textures
+(opaque, zero, cutout and ramp alpha, and the paired opacity maps) plus the
+committed `bc5_peak` corpus. Reach from a seed replay with LLVM coverage:
+`bc5_peak` reached `peak_row_sse41` (2,000 calls) and 82% of `bc4.rs` lines;
+`bc7_encode` reached 85% of `bc7_search.rs`, 79% of `bc7_objective.rs` and 87%
+of `avx2.rs` lines.
+
+| Target | Segments | Edges | Result |
+| --- | --- | ---: | --- |
+| `bc5_peak` | 2 x 600 s (278,164 executions), edges 861 then 861 | 861 | exit 0, no crash |
+| `bc7_encode` | 2 x 600 s after the fix (203,409 executions), edges 5,098 then 5,098 | 5,098 | exit 0, no crash |
+
+The first `bc7_encode` run found an overflow in `peak_choice`
+(`src/bc7_search.rs`): `p + PEAK_GAIN <= peak` on `u8` overflows when a
+finalist's peak error is 255 (a panic with overflow checks on, a wrap in a
+release build). Twenty-seven crashing inputs, one distinct fault, minimal input
+14 bytes. The comparison is now `peak.checked_sub(p)`, all 27 inputs replay
+without a crash, and `peak_choice_accepts_a_peak_error_of_255` in
+`src/bc7_search.rs` covers it, so the inputs were not kept. The rows above are
+the runs after the fix.
+
+Backend equality: the working corpora were replayed with `-runs=0` under
+`TEXENC_SIMD=scalar`, `sse41` and the default dispatch. `bc5_peak`: 1,027
+inputs, identical sorted digests (`9b254c777fa8d799`), exit 0. `bc7_encode`:
+3,152 inputs, identical sorted digests (`4ad9a0f03c73183b`), exit 0, before and
+after the fix. Both on x86_64 with AVX2; `-rss_limit_mb=512`
+throughout.
+
 ## Licence
 
 Licensed under either the [MIT licence](LICENSE-MIT) or the

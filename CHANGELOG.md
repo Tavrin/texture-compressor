@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-11-03
+
 ### Fixed
 
 - BC7 Balanced and Quality wrote black colour (RGB 0) wherever source alpha
