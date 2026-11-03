@@ -102,12 +102,27 @@ macro_rules! kernels {
                 }
                 let errors = store(best);
                 let chosen = store(best_index);
-                for l in 0..(reps.len - base).min($n) {
-                    let rep = base + l;
-                    idx[usize::from(reps.ids[rep])] = chosen[l] as u8;
-                    err += (errors[l] * i32::from(reps.counts[rep])) as u32;
-                    if err >= limit {
-                        return err;
+                let lanes = (reps.len - base).min($n);
+                // Every term is nonnegative, so the partial sums reach the
+                // limit inside this batch only if the batch total does; a
+                // batch that stays below it is added at once.
+                let mut sum = 0u32;
+                for l in 0..lanes {
+                    sum += (errors[l] * i32::from(reps.counts[base + l])) as u32;
+                }
+                if err.saturating_add(sum) < limit {
+                    for l in 0..lanes {
+                        idx[usize::from(reps.ids[base + l])] = chosen[l] as u8;
+                    }
+                    err += sum;
+                } else {
+                    for l in 0..lanes {
+                        let rep = base + l;
+                        idx[usize::from(reps.ids[rep])] = chosen[l] as u8;
+                        err += (errors[l] * i32::from(reps.counts[rep])) as u32;
+                        if err >= limit {
+                            return err;
+                        }
                     }
                 }
                 base += $n;
@@ -184,12 +199,27 @@ macro_rules! kernels {
                 }
                 let errors = store(best);
                 let chosen = store(best_index);
-                for l in 0..(reps.len - base).min($n) {
-                    let rep = base + l;
-                    idx[usize::from(reps.ids[rep])] = chosen[l] as u8;
-                    err += (errors[l] * i32::from(reps.counts[rep])) as u32;
-                    if err >= limit {
-                        return err;
+                let lanes = (reps.len - base).min($n);
+                // Every term is nonnegative, so the partial sums reach the
+                // limit inside this batch only if the batch total does; a
+                // batch that stays below it is added at once.
+                let mut sum = 0u32;
+                for l in 0..lanes {
+                    sum += (errors[l] * i32::from(reps.counts[base + l])) as u32;
+                }
+                if err.saturating_add(sum) < limit {
+                    for l in 0..lanes {
+                        idx[usize::from(reps.ids[base + l])] = chosen[l] as u8;
+                    }
+                    err += sum;
+                } else {
+                    for l in 0..lanes {
+                        let rep = base + l;
+                        idx[usize::from(reps.ids[rep])] = chosen[l] as u8;
+                        err += (errors[l] * i32::from(reps.counts[rep])) as u32;
+                        if err >= limit {
+                            return err;
+                        }
                     }
                 }
                 base += $n;
@@ -594,6 +624,63 @@ macro_rules! kernels {
                 }
             }
             out
+        }
+
+        // The integer sums of `least_squares`: Σ a²n, Σ abn, Σ b²n and per
+        // channel Σ a·x·n, Σ b·x·n over the representatives (weights b = w,
+        // a = 64 - w). Integer sums are exact in any order.
+        #[target_feature(enable = $feature)]
+        pub(super) fn ls_sums<const C0: usize, const C1: usize>(
+            px: &Block,
+            reps: &Reps,
+            idx: &[u8; 16],
+            weights: &[u8; 16],
+        ) -> LsSums {
+            let planes = planes(px);
+            let ids = bytes(&reps.ids);
+            let counts = bytes(&reps.counts);
+            let selectors = bytes(idx);
+            let weights = bytes(weights);
+            let iota = load(&core::array::from_fn(|l| l as i32));
+            let len = splat(reps.len as i32);
+            let mut aa = splat(0);
+            let mut ab = splat(0);
+            let mut bb = splat(0);
+            let mut ax = [splat(0); 4];
+            let mut bx = [splat(0); 4];
+            let mut base = 0;
+            while base < reps.len {
+                let at = add(splat(base as i32), iota);
+                let r = lookup(ids, at);
+                // Entries at and after `len` are unused: their count is zero.
+                let n = and(lookup(counts, at), gt(len, at));
+                let b = lookup(weights, lookup(selectors, r));
+                let a = sub(splat(64), b);
+                let an = mul(a, n);
+                let bn = mul(b, n);
+                aa = add(aa, mul(a, an));
+                ab = add(ab, mul(a, bn));
+                bb = add(bb, mul(b, bn));
+                for c in C0..C1 {
+                    let x = lookup(planes[c], r);
+                    ax[c] = add(ax[c], mul(an, x));
+                    bx[c] = add(bx[c], mul(bn, x));
+                }
+                base += $n;
+            }
+            let total = |v| store(v)[..$n].iter().sum::<i32>();
+            let mut sums = LsSums {
+                aa: total(aa),
+                ab: total(ab),
+                bb: total(bb),
+                ax: [0; 4],
+                bx: [0; 4],
+            };
+            for c in C0..C1 {
+                sums.ax[c] = total(ax[c]);
+                sums.bx[c] = total(bx[c]);
+            }
+            sums
         }
 
         #[target_feature(enable = $feature)]

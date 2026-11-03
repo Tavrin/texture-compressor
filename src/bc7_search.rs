@@ -31,35 +31,39 @@ pub(super) const PARTITION_LANES: usize = 68;
 impl Partitions {
     fn new<const CH: usize>(px: &Block) -> Self {
         let len = moment_len(CH);
-        let mut data = Self {
-            est: [(0.0, 0.0); 64],
-            rows: [[Moments::default(); 16]; 4],
-            zero: [Moments::default(); PARTITION_LANES],
-            one: [Moments::default(); PARTITION_LANES],
-        };
-        fill_moment_rows::<CH>(px, &mut data.rows);
+        let rows = moment_rows::<CH>(px);
         let mut total = Moments::default();
-        for row in &data.rows {
+        for row in &rows {
             for k in 0..len {
                 total.m[k] += row[15].m[k];
             }
         }
         // Integer sums: the order of the additions cannot change a moment.
-        for p in 0..PARTITION_LANES {
+        // Every entry is written once, without clearing the arrays first.
+        let one: [Moments; PARTITION_LANES] = core::array::from_fn(|p| {
             let mask = MASKS2[p.min(63)][0];
-            let mut one = data.rows[0][usize::from(mask & 15)];
+            let mut one = rows[0][usize::from(mask & 15)];
             for row in 1..4 {
-                let part = &data.rows[row][usize::from((mask >> (4 * row)) & 15)];
+                let part = &rows[row][usize::from((mask >> (4 * row)) & 15)];
                 for k in 0..len {
                     one.m[k] += part.m[k];
                 }
             }
-            let zero = &mut data.zero[p];
+            one
+        });
+        let zero = core::array::from_fn(|p| {
+            let mut zero = Moments::default();
             for k in 0..len {
-                zero.m[k] = total.m[k] - one.m[k];
+                zero.m[k] = total.m[k] - one[p].m[k];
             }
-            data.one[p] = one;
-        }
+            zero
+        });
+        let mut data = Self {
+            est: [(0.0, 0.0); 64],
+            rows,
+            zero,
+            one,
+        };
         #[cfg(feature = "simd")]
         if simd::partition_estimates::<CH>(&mut data.est, &data.zero, &data.one) {
             return data;
@@ -143,10 +147,16 @@ fn masks3(partition: usize) -> [u16; 3] {
     [!(m1 | m2), m1, m2]
 }
 
-// Estimated (residual, principal variance) of the first `count`
-// three-subset partitions from the RGB row moments of the two-subset
-// ranking; the rest are left unranked.
+// Three-subset partitions ranked by `partition_estimates3`, and their subset
+// moments plus padding up to a whole SIMD batch.
+const RANKED3: usize = 16;
+const RANKED3_LANES: usize = 3 * RANKED3 + 8;
+
+// Estimated (residual, principal variance) of the first `count` (at most
+// RANKED3) three-subset partitions from the RGB row moments of the
+// two-subset ranking; the rest are left unranked.
 fn partition_estimates3(lut: &[[Moments; 16]; 4], count: usize) -> [(f32, f32); 64] {
+    let count = count.min(RANKED3);
     let len = moment_len(3);
     let mut total = Moments::default();
     for row in lut {
@@ -154,8 +164,9 @@ fn partition_estimates3(lut: &[[Moments; 16]; 4], count: usize) -> [(f32, f32); 
             total.m[k] += row[15].m[k];
         }
     }
-    let mut out = [(f32::MAX, 0f32); 64];
-    for (p, slot) in out.iter_mut().enumerate().take(count) {
+    // Subsets zero, one and two of partition p at 3p, 3p + 1 and 3p + 2.
+    let mut subsets = [Moments::default(); RANKED3_LANES];
+    for p in 0..count {
         let mut parts = [Moments::default(); 2];
         for (s, part) in parts.iter_mut().enumerate() {
             let mask = MASKS3[p][s];
@@ -170,11 +181,26 @@ fn partition_estimates3(lut: &[[Moments; 16]; 4], count: usize) -> [(f32, f32); 
         for k in 0..len {
             zero.m[k] -= parts[0].m[k] + parts[1].m[k];
         }
+        subsets[3 * p] = zero;
+        subsets[3 * p + 1] = parts[0];
+        subsets[3 * p + 2] = parts[1];
+    }
+    let mut est = [(0f32, 0f32); RANKED3_LANES];
+    #[cfg(feature = "simd")]
+    let done = simd::subset_estimates::<3, RANKED3_LANES>(&mut est, &subsets, 3 * count);
+    #[cfg(not(feature = "simd"))]
+    let done = false;
+    if !done {
+        for (e, m) in est.iter_mut().zip(&subsets).take(3 * count) {
+            *e = subset_estimate::<3>(m);
+        }
+    }
+    let mut out = [(f32::MAX, 0f32); 64];
+    for (slot, e) in out.iter_mut().zip(est.as_chunks::<3>().0).take(count) {
         let mut sum = (0f32, 0f32);
-        for m in [&zero, &parts[0], &parts[1]] {
-            let e = subset_estimate::<3>(m);
-            sum.0 += e.0;
-            sum.1 += e.1;
+        for &(res, var) in e {
+            sum.0 += res;
+            sum.1 += var;
         }
         *slot = sum;
     }
@@ -327,8 +353,24 @@ const PEAK_FLOOR: u8 = 6;
 const PEAK_GAIN: u8 = 1;
 const PEAK_SLACK: u32 = 8;
 
+// Peak second look of an opaque block (see `peak_look`): a winner with a
+// channel error of at least PEAK_LOOK_FLOOR re-ranks its rough candidates by
+// peak and refines the PEAK_LOOK_REFINE lowest; one of them replaces the
+// winner if its peak is lower and its squared error at most 1/PEAK_LOOK_SLACK
+// above the winner's. Measured on the development set, fitting further
+// partitions for the look, a lower floor and a look for nonopaque blocks
+// did not lower guard failures (the last raised other channels' peaks).
+const PEAK_LOOK: bool = true;
+const PEAK_LOOK_FLOOR: u8 = 10;
+const PEAK_LOOK_REFINE: usize = 2;
+const PEAK_LOOK_SLACK: u32 = 4;
+
 // Up to eight refined candidates of one block, with their errors.
 type Finalists = [Option<(u32, Cand)>; 8];
+// Rough fits of one opaque block: at most one per planned fit.
+const ROUGH_SLOTS: usize = 32;
+// Candidates of the peak second look, with their errors.
+type Look = [Option<(u32, Cand)>; PEAK_LOOK_REFINE];
 
 fn push_finalist(finalists: &mut Finalists, candidate: (u32, Cand)) {
     if let Some(slot) = finalists.iter_mut().find(|f| f.is_none()) {
@@ -338,27 +380,207 @@ fn push_finalist(finalists: &mut Finalists, candidate: (u32, Cand)) {
 
 // Squared error stays the objective; the per-block peak decides only among
 // near-equal finalists, and only where the peak is large enough to set a
-// texture's maximum error.
-fn peak_choice(px: &Block, best: (u32, Cand), finalists: &Finalists) -> (u32, Cand) {
-    let peak = best.1.peak(px);
+// texture's maximum error. Second-look candidates compete under their own,
+// wider error bound.
+// `peak` is the winner's.
+fn peak_choice(
+    px: &Block,
+    best: (u32, Cand),
+    peak: u8,
+    finalists: &Finalists,
+    look: &Look,
+) -> (u32, Cand) {
     if peak < PEAK_FLOOR {
         return best;
     }
-    let limit = best.0.saturating_add(best.0 / PEAK_SLACK);
+    let near = best.0.saturating_add(best.0 / PEAK_SLACK);
+    let wide = best.0.saturating_add(best.0 / PEAK_LOOK_SLACK);
     let mut pick = (peak, best);
-    for &(err, cand) in finalists.iter().flatten() {
-        if err > limit {
-            continue;
-        }
-        let p = cand.peak(px);
-        // `peak - p >= PEAK_GAIN` without u8 overflow when p is 255.
-        if peak.checked_sub(p).is_some_and(|gain| gain >= PEAK_GAIN)
-            && (p, err) < (pick.0, pick.1 .0)
-        {
-            pick = (p, (err, cand));
+    let tiers = [(near, &finalists[..]), (wide, &look[..])];
+    for (limit, list) in tiers {
+        for &(err, cand) in list.iter().flatten() {
+            if err > limit {
+                continue;
+            }
+            let p = cand.peak(px);
+            // `peak - p >= PEAK_GAIN` without u8 overflow when p is 255.
+            if peak.checked_sub(p).is_some_and(|gain| gain >= PEAK_GAIN)
+                && (p, err) < (pick.0, pick.1 .0)
+            {
+                pick = (p, (err, cand));
+            }
         }
     }
     pick.1
+}
+
+// The block with channel c read from channel map[c] (a dual-mode rotation).
+#[inline]
+fn rotate(px: &Block, map: [usize; 4]) -> Block {
+    let mut out = [[0u8; 4]; 16];
+    for (o, p) in out.iter_mut().zip(px) {
+        for c in 0..4 {
+            o[c] = p[map[c]];
+        }
+    }
+    out
+}
+
+// Identity of a rough candidate: its mode and partition, or its mode,
+// rotation and index selection.
+fn rough_key(r: &Rough) -> (usize, usize, usize) {
+    match *r {
+        Rough::Dual((_, mode, rotation, sel, _, _)) => (mode, rotation, sel),
+        Rough::Two((_, mode, partition, _)) => (mode, partition, 0),
+        Rough::Three((_, partition, _)) => (0, partition, 0),
+    }
+}
+
+// The candidate a rough fit stands for, unrefined.
+fn rough_candidate(px: &Block, r: Rough, flat_extreme_alpha: bool) -> (u32, Cand) {
+    match r {
+        Rough::Dual((err, mode, rotation, sel, color, alpha)) => {
+            let compact = flat_extreme_alpha && rotation > 0;
+            (
+                err,
+                Cand::Dual {
+                    mode,
+                    rotation,
+                    sel,
+                    color: restore_color(color, rotation, compact, px[0][3]),
+                    alpha,
+                },
+            )
+        }
+        Rough::Two((err, mode, partition, s)) => (err, Cand::Two { mode, partition, s }),
+        Rough::Three((err, partition, s)) => (err, Cand::Three { partition, s }),
+    }
+}
+
+// Refine one rough candidate of an opaque block while the remaining work
+// pays for it; otherwise it competes with its rough fit and exact error.
+fn refine_rough(
+    px: &Block,
+    reps: &Reps,
+    r: Rough,
+    cfg: &Search,
+    work: &mut Work,
+    flat_extreme_alpha: bool,
+) -> (u32, Cand) {
+    let n = reps.len as u32;
+    match r {
+        Rough::Dual((_, mode, rotation, sel, mut color, mut alpha)) => {
+            let compact = flat_extreme_alpha && rotation > 0;
+            let charge = 2 * improve_work(n, cfg.refine_iters, cfg.refine_rounds);
+            if work.take(charge) {
+                let map = dual_map(rotation, compact);
+                let rotated = rotate(px, map);
+                let passes = refine_dual(
+                    &rotated, reps, mode, sel, &mut color, &mut alpha, cfg, compact,
+                );
+                work.refund(charge, passes * n);
+            }
+            (
+                color.err + alpha.err,
+                Cand::Dual {
+                    mode,
+                    rotation,
+                    sel,
+                    color: restore_color(color, rotation, compact, px[0][3]),
+                    alpha,
+                },
+            )
+        }
+        Rough::Two((_, mode, partition, mut s)) => {
+            let m1 = MASKS2[partition][0];
+            let charge = refine_work(mode, subset_len(reps, &[!m1, m1]), cfg, true);
+            if work.take(charge) {
+                let mut used = 0;
+                for (k, mask) in [!m1, m1].into_iter().enumerate() {
+                    let r = reps.masked(mask);
+                    used += r.len as u32 * refine_subset(px, mode, &r, &mut s[k], true, cfg);
+                }
+                work.refund(charge, used);
+            }
+            (s[0].err + s[1].err, Cand::Two { mode, partition, s })
+        }
+        Rough::Three((_, partition, mut s)) => {
+            let masks = masks3(partition);
+            let charge = refine_work(0, subset_len(reps, &masks), cfg, true);
+            if work.take(charge) {
+                let mut used = 0;
+                for (k, mask) in masks.into_iter().enumerate() {
+                    let r = reps.masked(mask);
+                    used += r.len as u32 * refine_subset(px, 0, &r, &mut s[k], true, cfg);
+                }
+                work.refund(charge, used);
+            }
+            (s[0].err + s[1].err + s[2].err, Cand::Three { partition, s })
+        }
+    }
+}
+
+// The squared-error search keeps few rough candidates per mode, so a block
+// whose winner leaves one large channel error rarely refines the partition
+// or mode that would avoid it. When the winner's peak reaches
+// PEAK_LOOK_FLOOR, every rough fit of the search that was not refined is
+// re-ranked by its peak (then its error); the PEAK_LOOK_REFINE lowest peaks
+// below the winner's, with a rough error at most a quarter above the
+// winner's, are refined. Peaks are paid as one pass each and refinement as
+// in the refinement pool, from the block's remaining work (`refine` refines
+// one rough candidate and charges it). `n` is the block's representatives.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the second look reads the search state of one block"
+)]
+fn peak_look(
+    px: &Block,
+    n: u32,
+    (best_err, peak): (u32, u8),
+    roughs: &[Option<Rough>],
+    refined: &[Option<Rough>],
+    work: &mut Work,
+    flat_extreme_alpha: bool,
+    mut refine: impl FnMut(Rough, &mut Work) -> (u32, Cand),
+) -> Look {
+    let mut look: Look = [None; PEAK_LOOK_REFINE];
+    if !PEAK_LOOK || PEAK_LOOK_REFINE == 0 || peak < PEAK_LOOK_FLOOR {
+        return look;
+    }
+    let limit = best_err.saturating_add(best_err / 4);
+    // (peak, rough error, slot), ordered by peak then error; ties keep the
+    // search order.
+    let mut ranked = [(0u8, 0u32, 0usize); ROUGH_SLOTS];
+    let mut len = 0;
+    for (slot, r) in roughs.iter().enumerate().take(ROUGH_SLOTS) {
+        let Some(r) = r else {
+            continue;
+        };
+        let key = rough_key(r);
+        if r.err() > limit || refined.iter().flatten().any(|k| rough_key(k) == key) {
+            continue;
+        }
+        if !work.take(n) {
+            break;
+        }
+        let p = rough_candidate(px, *r, flat_extreme_alpha).1.peak(px);
+        if p >= peak {
+            continue;
+        }
+        let mut at = len;
+        while at > 0 && (p, r.err()) < (ranked[at - 1].0, ranked[at - 1].1) {
+            ranked[at] = ranked[at - 1];
+            at -= 1;
+        }
+        ranked[at] = (p, r.err(), slot);
+        len += 1;
+    }
+    for (out, &(_, _, slot)) in look.iter_mut().zip(&ranked[..len]) {
+        if let Some(r) = roughs[slot] {
+            *out = Some(refine(r, work));
+        }
+    }
+    look
 }
 
 /// Remaining work of one block, counted in representative passes: one unit
@@ -432,8 +654,13 @@ fn refine_work(mode: usize, n: u32, cfg: &Search, opaque: bool) -> u32 {
 }
 
 // The representatives of each subset of a partition.
+#[inline]
 fn subset_len(reps: &Reps, masks: &[u16]) -> u32 {
-    masks.iter().map(|&m| reps.masked(m).len as u32).sum()
+    let mut len = 0;
+    for &m in masks {
+        len += reps.masked_len(m) as u32;
+    }
+    len
 }
 
 // Representatives of every subset of an opaque candidate, per channel group.
@@ -684,6 +911,7 @@ impl<const N: usize> Default for Ranking<N> {
 }
 
 impl<const N: usize> Ranking<N> {
+    #[inline]
     fn insert(&mut self, estimate: f32, plan: Plan) {
         debug_assert!(self.len < self.items.len());
         if self.len == self.items.len() {
@@ -1494,7 +1722,7 @@ fn search_seeded(px: &Block, cfg: &Search, seed: Option<Fit>) -> (u32, Cand) {
     let flat_extreme_alpha = opaque || (!alpha_varies && px[0][3] == 0);
     let est = dual_estimates(px, &reps);
     let partitions = Partitions::new::<3>(px);
-    let mut plan = Ranking::<32>::default();
+    let mut plan = Ranking::<ROUGH_SLOTS>::default();
     for (mode, count) in [(5usize, cfg.duals[0]), (4, cfg.duals[1])] {
         // Four rotations, or three rotations with two index selections.
         let mut options = Ranking::<6>::default();
@@ -1540,7 +1768,9 @@ fn search_seeded(px: &Block, cfg: &Search, seed: Option<Fit>) -> (u32, Cand) {
     let mut kept_dual: [Option<RankedDual>; 2] = [None; 2];
     let mut kept: [[Option<RankedTwo>; 2]; 2] = [[None; 2]; 2];
     let mut kept3: Option<RankedThree> = None;
-    for &(_, step) in plan.best(plan.len) {
+    // Every rough fit, in plan order, for the peak second look.
+    let mut roughs: [Option<Rough>; ROUGH_SLOTS] = [None; ROUGH_SLOTS];
+    for (slot, &(_, step)) in plan.best(plan.len).iter().enumerate() {
         if let Plan::Two { mode, partition } = step {
             let m1 = MASKS2[partition][0];
             let sub = [reps.masked(!m1), reps.masked(m1)];
@@ -1560,12 +1790,15 @@ fn search_seeded(px: &Block, cfg: &Search, seed: Option<Fit>) -> (u32, Cand) {
                 shared[0] = Some((partition, t));
                 t
             });
-            let s =
-                [0, 1].map(|k| rough(px, &sub[k], &t[k], mode, true, cfg.rough_iters, u32::MAX));
+            let s = [
+                rough(px, &sub[0], &t[0], mode, true, cfg.rough_iters, u32::MAX),
+                rough(px, &sub[1], &t[1], mode, true, cfg.rough_iters, u32::MAX),
+            ];
             let err = s[0].err + s[1].err;
             if err == 0 {
                 return (0, Cand::Two { mode, partition, s });
             }
+            roughs[slot] = Some(Rough::Two((err, mode, partition, s)));
             retain_partition(&mut kept[usize::from(mode == 1)], (err, mode, partition, s));
             continue;
         }
@@ -1582,6 +1815,7 @@ fn search_seeded(px: &Block, cfg: &Search, seed: Option<Fit>) -> (u32, Cand) {
             if kept3.is_none_or(|k| err < k.0) {
                 kept3 = Some((err, partition, s));
             }
+            roughs[slot] = Some(Rough::Three((err, partition, s)));
             continue;
         }
         let Plan::Dual {
@@ -1609,10 +1843,16 @@ fn search_seeded(px: &Block, cfg: &Search, seed: Option<Fit>) -> (u32, Cand) {
             let sel = slot.saturating_sub(1);
             let compact = flat_extreme_alpha && rotation > 0;
             let map = dual_map(rotation, compact);
-            let rotated = px.map(|p| map.map(|c| p[c]));
+            let rotated = rotate(px, map);
             let t = targets[rotation].get_or_insert_with(|| {
-                let mean = map.map(|c| est.mean[c]);
-                let cov = map.map(|c| map.map(|e| est.cov[c][e]));
+                let mut mean = [0f32; 4];
+                let mut cov = [[0f32; 4]; 4];
+                for c in 0..4 {
+                    mean[c] = est.mean[map[c]];
+                    for e in 0..4 {
+                        cov[c][e] = est.cov[map[c]][map[e]];
+                    }
+                }
                 [
                     if compact {
                         axis_endpoints::<0, 2>(&rotated, &reps, &mean, &cov)
@@ -1640,6 +1880,7 @@ fn search_seeded(px: &Block, cfg: &Search, seed: Option<Fit>) -> (u32, Cand) {
             if kept.is_none_or(|k| err < k.0) {
                 *kept = Some((err, mode, rotation, sel, color, alpha));
             }
+            roughs[slot] = Some(Rough::Dual((err, mode, rotation, sel, color, alpha)));
         }
     }
     for (slot, kept) in kept_dual.into_iter().enumerate() {
@@ -1681,6 +1922,7 @@ fn search_seeded(px: &Block, cfg: &Search, seed: Option<Fit>) -> (u32, Cand) {
         order[at] = slot;
         len += 1;
     }
+    let mut refined: [Option<Rough>; 7] = [None; 7];
     for &slot in &order[..len] {
         let Some(r) = pool[slot] else {
             continue;
@@ -1688,56 +1930,8 @@ fn search_seeded(px: &Block, cfg: &Search, seed: Option<Fit>) -> (u32, Cand) {
         if r.err() > best_err.saturating_add(best_err / 4) {
             continue;
         }
-        let candidate = match r {
-            Rough::Dual((_, mode, rotation, sel, mut color, mut alpha)) => {
-                let compact = flat_extreme_alpha && rotation > 0;
-                let charge = 2 * improve_work(n, cfg.refine_iters, cfg.refine_rounds);
-                if work.take(charge) {
-                    let map = dual_map(rotation, compact);
-                    let rotated = px.map(|p| map.map(|c| p[c]));
-                    let passes = refine_dual(
-                        &rotated, &reps, mode, sel, &mut color, &mut alpha, cfg, compact,
-                    );
-                    work.refund(charge, passes * n);
-                }
-                (
-                    color.err + alpha.err,
-                    Cand::Dual {
-                        mode,
-                        rotation,
-                        sel,
-                        color: restore_color(color, rotation, compact, px[0][3]),
-                        alpha,
-                    },
-                )
-            }
-            Rough::Two((_, mode, partition, mut s)) => {
-                let m1 = MASKS2[partition][0];
-                let charge = refine_work(mode, subset_len(&reps, &[!m1, m1]), cfg, true);
-                if work.take(charge) {
-                    let mut used = 0;
-                    for (k, mask) in [!m1, m1].into_iter().enumerate() {
-                        let r = reps.masked(mask);
-                        used += r.len as u32 * refine_subset(px, mode, &r, &mut s[k], true, cfg);
-                    }
-                    work.refund(charge, used);
-                }
-                (s[0].err + s[1].err, Cand::Two { mode, partition, s })
-            }
-            Rough::Three((_, partition, mut s)) => {
-                let masks = masks3(partition);
-                let charge = refine_work(0, subset_len(&reps, &masks), cfg, true);
-                if work.take(charge) {
-                    let mut used = 0;
-                    for (k, mask) in masks.into_iter().enumerate() {
-                        let r = reps.masked(mask);
-                        used += r.len as u32 * refine_subset(px, 0, &r, &mut s[k], true, cfg);
-                    }
-                    work.refund(charge, used);
-                }
-                (s[0].err + s[1].err + s[2].err, Cand::Three { partition, s })
-            }
-        };
+        refined[slot] = Some(r);
+        let candidate = refine_rough(px, &reps, r, cfg, &mut work, flat_extreme_alpha);
         push_finalist(&mut finalists, candidate);
         if candidate.0 < best_err {
             (best_err, best) = candidate;
@@ -1755,10 +1949,20 @@ fn search_seeded(px: &Block, cfg: &Search, seed: Option<Fit>) -> (u32, Cand) {
     }
     // The opt-in policy reproduces the earlier output on every block.
     if cfg.hide_transparent {
-        (best_err, best)
-    } else {
-        peak_choice(px, (best_err, best), &finalists)
+        return (best_err, best);
     }
+    let peak = best.peak(px);
+    let look = peak_look(
+        px,
+        n,
+        (best_err, peak),
+        &roughs,
+        &refined,
+        &mut work,
+        flat_extreme_alpha,
+        |r, work| refine_rough(px, &reps, r, cfg, work, flat_extreme_alpha),
+    );
+    peak_choice(px, (best_err, best), peak, &finalists, &look)
 }
 
 // Nonopaque blocks carry original-channel observation weights through every
@@ -2044,10 +2248,12 @@ fn visible_search(source: &Block, cfg: &Search) -> (u32, Cand) {
     // The opt-in policy reproduces the earlier output on every block
     // (its invisible colour would otherwise enter the peak).
     if cfg.hide_transparent {
-        best
-    } else {
-        peak_choice(px, best, &finalists)
+        return best;
     }
+    // Nonopaque blocks take no second look: measured on the 71-texture
+    // set, it raised other channels' peaks and cost PSNR on noisy alpha.
+    let peak = best.1.peak(px);
+    peak_choice(px, best, peak, &finalists, &[None; PEAK_LOOK_REFINE])
 }
 
 #[cfg(feature = "simd")]
@@ -2086,6 +2292,33 @@ mod tests {
     }
 
     #[test]
+    fn second_look_candidates_use_the_wider_error_bound() {
+        // One red texel of 20 on black: a black fit peaks at 20, a fit of
+        // red 10 everywhere peaks at 10.
+        let mut px: Block = [[0, 0, 0, 255]; 16];
+        px[0][0] = 20;
+        let flat = |r: i32| {
+            Cand::Six(Fit {
+                err: 0,
+                d: [[r, 0, 0, 255]; 2],
+                idx: [0; 16],
+            })
+        };
+        let (black, red) = (flat(0), flat(10));
+        assert_eq!((black.peak(&px), red.peak(&px)), (20, 10));
+        // 1200 is above 1000 + 1000 / PEAK_SLACK but within 1000 / PEAK_LOOK_SLACK.
+        let mut finalists: Finalists = [None; 8];
+        finalists[1] = Some((1200, red));
+        let none = [None; PEAK_LOOK_REFINE];
+        let (err, _) = peak_choice(&px, (1000, black), 20, &finalists, &none);
+        assert_eq!(err, 1000);
+        let mut look: Look = [None; PEAK_LOOK_REFINE];
+        look[0] = Some((1200, red));
+        let (err, picked) = peak_choice(&px, (1000, black), 20, &[None; 8], &look);
+        assert_eq!((err, picked.peak(&px)), (1200, 10));
+    }
+
+    #[test]
     fn peak_choice_accepts_a_peak_error_of_255() {
         // An all-black block decodes exactly; one texel of 255 then gives the
         // best candidate and its finalist a peak of 255, where `peak + gain`
@@ -2097,7 +2330,13 @@ mod tests {
         assert_eq!(cand.peak(&px), 255);
         let mut finalists: Finalists = [None; 8];
         finalists[0] = Some((1000, cand));
-        let (err, picked) = peak_choice(&px, (1000, cand), &finalists);
+        let (err, picked) = peak_choice(
+            &px,
+            (1000, cand),
+            cand.peak(&px),
+            &finalists,
+            &[None; PEAK_LOOK_REFINE],
+        );
         assert_eq!(err, 1000);
         assert_eq!(picked.pack(), cand.pack());
     }

@@ -155,6 +155,27 @@ const fn quant_tables() -> [[[u8; 256]; 3]; 9] {
 }
 static QUANT: [[[u8; 256]; 3]; 9] = quant_tables();
 
+// The set bits of each byte value in ascending order, offset by 0 (low mask
+// byte) or 8 (high byte); entries past the bit count are zero.
+const fn set_bits(offset: u8) -> [[u8; 8]; 256] {
+    let mut table = [[0u8; 8]; 256];
+    let mut byte = 0;
+    while byte < 256 {
+        let mut n = 0;
+        let mut bit = 0;
+        while bit < 8 {
+            if byte >> bit & 1 == 1 {
+                table[byte][n] = bit as u8 + offset;
+                n += 1;
+            }
+            bit += 1;
+        }
+        byte += 1;
+    }
+    table
+}
+static SET_BITS: [[[u8; 8]; 256]; 2] = [set_bits(0), set_bits(8)];
+
 // The pixels a fit scores: one representative pixel per distinct colour with
 // its multiplicity, and each pixel's representative. Pixel indices and
 // counts are separate byte arrays so vector selectors can load them whole;
@@ -200,23 +221,24 @@ impl Reps {
         r
     }
 
-    // Every pixel of the subset is its own representative.
+    // Every pixel of the subset is its own representative: the set bits in
+    // ascending order, from one table lookup per mask byte.
     fn subset(mask: u16) -> Self {
-        let mut r = Reps {
-            ids: [0; 16],
-            counts: [0; 16],
-            len: 0,
+        let low = usize::from(mask as u8);
+        let high = usize::from((mask >> 8) as u8);
+        let split = low.count_ones() as usize;
+        let len = mask.count_ones() as usize;
+        let mut ids = [0u8; 16];
+        ids[..8].copy_from_slice(&SET_BITS[0][low]);
+        // Unused table entries are zero, so the tail past `len` stays zero.
+        ids[split..split + 8].copy_from_slice(&SET_BITS[1][high]);
+        Reps {
+            ids,
+            counts: core::array::from_fn(|j| u8::from(j < len)),
+            len,
             of: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
             expand: false,
-        };
-        let mut m = mask;
-        while m != 0 {
-            r.ids[r.len] = m.trailing_zeros() as u8;
-            r.counts[r.len] = 1;
-            r.len += 1;
-            m &= m - 1;
         }
-        r
     }
 
     // Restrict full-block colour representatives to a subset. A representative
@@ -246,6 +268,22 @@ impl Reps {
         r
     }
 
+    // `self.masked(mask).len` without building the subset: the distinct
+    // representatives of the masked pixels.
+    #[inline]
+    fn masked_len(&self, mask: u16) -> usize {
+        if !self.expand {
+            return mask.count_ones() as usize;
+        }
+        let mut seen = 0u16;
+        let mut m = mask;
+        while m != 0 {
+            seen |= 1 << self.of[m.trailing_zeros() as usize];
+            m &= m - 1;
+        }
+        seen.count_ones() as usize
+    }
+
     #[inline]
     fn iter(&self) -> impl Iterator<Item = (usize, i32)> + '_ {
         self.ids[..self.len]
@@ -257,6 +295,7 @@ impl Reps {
 
 // Quantize endpoint targets (0..=255) over channels C0..C1. A forced p-bit of
 // one keeps opaque alpha exactly 255 in the modes that store alpha.
+#[inline]
 fn quantize<const C0: usize, const C1: usize>(t: &Pair, prec: Prec, force_p1: bool) -> Pair {
     let table = &QUANT[prec.bits];
     let quant_err = |k: usize, p: usize| -> i32 {
@@ -287,6 +326,7 @@ fn quantize<const C0: usize, const C1: usize>(t: &Pair, prec: Prec, force_p1: bo
 }
 
 // Quantize endpoint targets with the given low bit per endpoint (2 for none).
+#[inline]
 fn quantize_with<const C0: usize, const C1: usize>(
     t: &Pair,
     prec: Prec,
@@ -311,6 +351,8 @@ struct Fit {
 
 // Exact decoded SSE of the best selector near each colour's projection,
 // stopping early once `limit` is reached (selectors are then incomplete).
+// Inlined so that each caller dispatches directly to the vector selector.
+#[inline]
 fn select<const C0: usize, const C1: usize>(
     px: &Block,
     reps: &Reps,
@@ -509,24 +551,35 @@ fn least_squares<const C0: usize, const C1: usize>(
     lv: &Levels,
 ) -> Option<Pair> {
     // Sums over 16 texels of 64 * 64 * 255 at most stay inside i32; the
-    // products below widen to i64.
-    let mut aa = 0i32;
-    let mut ab = 0i32;
-    let mut bb = 0i32;
-    let mut ax = [0i32; 4];
-    let mut bx = [0i32; 4];
-    for (i, count) in reps.iter() {
-        let b = lv.w[usize::from(idx[i])];
-        let a = 64 - b;
-        aa += a * a * count;
-        ab += a * b * count;
-        bb += b * b * count;
-        for c in C0..C1 {
-            let x = i32::from(px[i][c]) * count;
-            ax[c] += a * x;
-            bx[c] += b * x;
+    // products below widen to i64. Integer sums are exact in any order, so
+    // the vector sums equal the scalar ones.
+    #[cfg(feature = "simd")]
+    let sums = simd::ls_sums::<C0, C1>(px, reps, idx, lv).map(|s| (s.aa, s.ab, s.bb, s.ax, s.bx));
+    #[cfg(not(feature = "simd"))]
+    let sums: Option<(i32, i32, i32, [i32; 4], [i32; 4])> = None;
+    let (aa, ab, bb, ax, bx) = match sums {
+        Some(s) => s,
+        None => {
+            let mut aa = 0i32;
+            let mut ab = 0i32;
+            let mut bb = 0i32;
+            let mut ax = [0i32; 4];
+            let mut bx = [0i32; 4];
+            for (i, count) in reps.iter() {
+                let b = lv.w[usize::from(idx[i])];
+                let a = 64 - b;
+                aa += a * a * count;
+                ab += a * b * count;
+                bb += b * b * count;
+                for c in C0..C1 {
+                    let x = i32::from(px[i][c]) * count;
+                    ax[c] += a * x;
+                    bx[c] += b * x;
+                }
+            }
+            (aa, ab, bb, ax, bx)
         }
-    }
+    };
     let (aa, ab, bb) = (i64::from(aa), i64::from(ab), i64::from(bb));
     let (ax, bx) = (ax.map(i64::from), bx.map(i64::from));
     let det = aa * bb - ab * ab;
