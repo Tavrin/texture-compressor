@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-03
+
 ### Changed
 
 - BC7 Balanced and Quality now spend a fixed per-block work budget instead of
