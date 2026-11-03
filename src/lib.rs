@@ -427,26 +427,39 @@ pub use hdr::{decode_bc6h, encode_hdr, encode_hdr_into, HdrImageView};
 fn encode_peak_row<const CHANNELS: usize>(image: ImageView<'_>, by: usize, row: &mut [u8]) {
     #[cfg(all(feature = "simd", feature = "std", target_arch = "x86_64"))]
     if let Some(encoder) = bc7::range_encoder_sse41() {
-        encode_peak_row_with::<CHANNELS>(image, by, row, |values| encoder.encode(values));
+        // Complete blocks run in one vector kernel; only a partial final
+        // block takes the replicated-edge gather below.
+        let complete = image.width as usize / 4;
+        let rows: [usize; 4] =
+            core::array::from_fn(|y| (by * 4 + y).min(image.height as usize - 1) * image.stride);
+        encoder.encode_row::<CHANNELS>(image.data, rows, complete, row);
+        encode_peak_row_with::<CHANNELS>(image, by, row, complete, |values| encoder.encode(values));
         return;
     }
     #[cfg(all(feature = "simd", feature = "std", target_arch = "x86_64"))]
     if let Some(encoder) = bc7::range_encoder() {
-        encode_peak_row_with::<CHANNELS>(image, by, row, |values| encoder.encode(values));
+        encode_peak_row_with::<CHANNELS>(image, by, row, 0, |values| encoder.encode(values));
         return;
     }
-    encode_peak_row_with::<CHANNELS>(image, by, row, bc4::range_fit_values);
+    encode_peak_row_with::<CHANNELS>(image, by, row, 0, bc4::range_fit_values);
 }
 
 fn encode_peak_row_with<const CHANNELS: usize>(
     image: ImageView<'_>,
     by: usize,
     row: &mut [u8],
+    first: usize,
     fit: impl Fn(&[u8; 16]) -> [u8; 8],
 ) {
     let source_rows: [usize; 4] =
         core::array::from_fn(|y| (by * 4 + y).min(image.height as usize - 1) * image.stride);
-    for (bx, dst) in row.as_chunks_mut::<16>().0.iter_mut().enumerate() {
+    for (bx, dst) in row
+        .as_chunks_mut::<16>()
+        .0
+        .iter_mut()
+        .enumerate()
+        .skip(first)
+    {
         let mut red = [0; 16];
         let mut green = [0; 16];
         let complete = bx < image.width as usize / 4;

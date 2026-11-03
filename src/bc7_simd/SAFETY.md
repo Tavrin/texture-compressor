@@ -128,3 +128,14 @@ then zero-extends the eight results to u16 for PHMINPOSUW. Max uses the same
 unsigned minimum on complemented byte maxima. Values remain 0..255, and the
 minpos index bits are ignored by extracting only the low byte. All source,
 table and packed-output accesses retain the same fixed-array contracts.
+
+`Sse41RangeEncoder::encode_row` runs `peak_row_sse41` over the complete
+blocks of one BC5 block row. Every source access is a bounds-checked slice of
+exactly `4 * CHANNELS` bytes per source row, which the single unsafe block
+reads with one unaligned 8-byte (RG8) or 16-byte (RGBA8) load; R and G are
+separated with byte shuffles and the fit stays in registers (`fit_sse41`, no
+memory round trip). Selector bits are read with `movq`/`pextrq` instead of a
+stored array, and the bound table is padded to eight bytes so its load is
+in-bounds. Output stores are safe 8-byte slice copies. The kernel is
+byte-identical to the per-block gather path, which remains for partial
+edge blocks and other ISAs.
