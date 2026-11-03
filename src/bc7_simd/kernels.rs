@@ -502,6 +502,100 @@ macro_rules! kernels {
             })
         }
 
+        // One texel set per slot from its weighted sums (objective::Sums):
+        // `sums_covariance`, then `principal` over RGB and, when RGBA, over
+        // RGBA. The integer moments of at most 16 texels stay inside i32 and
+        // convert exactly as their i64 originals; every float operation is
+        // the scalar one in the scalar order. Slots past $n stay zero.
+        #[target_feature(enable = $feature)]
+        pub(super) fn weighted_estimates<const RGBA: bool>(
+            sums: &[[i32; 17]; 8],
+            cw: f32,
+            aw: f32,
+        ) -> [[(f32, f32); 8]; 2] {
+            let s: [_; 17] = core::array::from_fn(|k| load(&core::array::from_fn(|l| sums[l][k])));
+            let one = splat(1);
+            let (cw, aw) = (fsplat(cw), fsplat(aw));
+            let nv = to_float(vmax(s[0], one));
+            let nt = to_float(vmax(s[14], one));
+            let mut cov = [[fsplat(0.0); 4]; 4];
+            let mut k = 5;
+            for c in 0..3 {
+                for e in c..3 {
+                    let v = fmul(
+                        fmul(
+                            fdiv(to_float(sub(mul(s[0], s[k]), mul(s[1 + c], s[1 + e]))), nv),
+                            cw,
+                        ),
+                        cw,
+                    );
+                    cov[c][e] = v;
+                    cov[e][c] = v;
+                    k += 1;
+                }
+            }
+            for c in 0..3 {
+                let v = fmul(
+                    fmul(
+                        fdiv(to_float(sub(mul(s[0], s[11 + c]), mul(s[1 + c], s[4]))), nv),
+                        cw,
+                    ),
+                    aw,
+                );
+                cov[c][3] = v;
+                cov[3][c] = v;
+            }
+            cov[3][3] = fmul(
+                fmul(
+                    fdiv(to_float(sub(mul(s[14], s[16]), mul(s[15], s[15]))), nt),
+                    aw,
+                ),
+                aw,
+            );
+            let cols: [[[f32; $n]; 4]; 4] = core::array::from_fn(|c| cov[c].map(|v| fstore(v)));
+            let mut out = [[(0.0, 0.0); 8]; 2];
+            for (slot, ch) in [(0, 3), (1, 4)] {
+                if slot == 1 && !RGBA {
+                    break;
+                }
+                let mut trace = fsplat(0.0);
+                for c in 0..ch {
+                    trace = fadd(trace, cov[c][c]);
+                }
+                // The first largest diagonal entry, as the scalar `top`.
+                let top: [usize; $n] = core::array::from_fn(|l| {
+                    let mut t = 0;
+                    for c in 0..ch {
+                        if cols[c][c][l] > cols[t][t][l] {
+                            t = c;
+                        }
+                    }
+                    t
+                });
+                let w: [_; 4] =
+                    core::array::from_fn(|c| fload(&core::array::from_fn(|l| cols[c][top[l]][l])));
+                let mut ww = fsplat(0.0);
+                let mut wcw = fsplat(0.0);
+                for c in 0..ch {
+                    let mut cwv = fsplat(0.0);
+                    for e in 0..ch {
+                        cwv = fadd(cwv, fmul(cov[c][e], w[e]));
+                    }
+                    ww = fadd(ww, fmul(w[c], w[c]));
+                    wcw = fadd(wcw, fmul(w[c], cwv));
+                }
+                let quot = fstore(fdiv(wcw, ww));
+                let traces = fstore(trace);
+                for l in 0..$n {
+                    if traces[l] > 0.0 {
+                        let lambda = quot[l].min(traces[l]);
+                        out[slot][l] = (traces[l] - lambda, lambda);
+                    }
+                }
+            }
+            out
+        }
+
         #[target_feature(enable = $feature)]
         pub(super) fn estimates<const CH: usize>(moments: &[Moments; 8]) -> [(f32, f32); 8] {
             // Only the count, sums and products of CH channels are read.
