@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Changed
+
+- BC7 Balanced and Quality encode blocks with transparent texels faster:
+  the weighted search shares its per-texel sums across colour channels and
+  ranks partitions with SSE4.1, AVX2, NEON and wasm simd128 kernels. Output
+  bytes are unchanged, and every backend produces the scalar bytes.
+- BC7 least-squares endpoint fits accumulate in 32-bit integers (exact for
+  16 texels), with the same output.
+
 ## [0.2.2] - 2026-11-03
 
 ### Fixed

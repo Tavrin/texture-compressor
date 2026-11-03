@@ -246,6 +246,7 @@ impl Reps {
         r
     }
 
+    #[inline]
     fn iter(&self) -> impl Iterator<Item = (usize, i32)> + '_ {
         self.ids[..self.len]
             .iter()
@@ -507,24 +508,27 @@ fn least_squares<const C0: usize, const C1: usize>(
     idx: &[u8; 16],
     lv: &Levels,
 ) -> Option<Pair> {
-    let mut aa = 0i64;
-    let mut ab = 0i64;
-    let mut bb = 0i64;
-    let mut ax = [0i64; 4];
-    let mut bx = [0i64; 4];
+    // Sums over 16 texels of 64 * 64 * 255 at most stay inside i32; the
+    // products below widen to i64.
+    let mut aa = 0i32;
+    let mut ab = 0i32;
+    let mut bb = 0i32;
+    let mut ax = [0i32; 4];
+    let mut bx = [0i32; 4];
     for (i, count) in reps.iter() {
-        let count = i64::from(count);
-        let b = i64::from(lv.w[usize::from(idx[i])]);
+        let b = lv.w[usize::from(idx[i])];
         let a = 64 - b;
         aa += a * a * count;
         ab += a * b * count;
         bb += b * b * count;
         for c in C0..C1 {
-            let x = i64::from(px[i][c]) * count;
+            let x = i32::from(px[i][c]) * count;
             ax[c] += a * x;
             bx[c] += b * x;
         }
     }
+    let (aa, ab, bb) = (i64::from(aa), i64::from(ab), i64::from(bb));
+    let (ax, bx) = (ax.map(i64::from), bx.map(i64::from));
     let det = aa * bb - ab * ab;
     if det == 0 {
         return None;
@@ -922,6 +926,7 @@ fn fill_moment_rows<const CH: usize>(px: &Block, lut: &mut [[Moments; 16]; 4]) {
 }
 
 // Off-axis residual and principal variance of one subset, in SSE units.
+#[inline]
 fn subset_estimate<const CH: usize>(m: &Moments) -> (f32, f32) {
     let n = m.m[0];
     let mut cov = [[0f32; 4]; 4];

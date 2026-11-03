@@ -11,16 +11,36 @@ pub(super) struct Objective {
 }
 
 impl Objective {
+    #[inline]
     pub fn weight(self, i: usize, c: usize) -> i32 {
         if c == usize::from(self.alpha) {
             i32::from(self.alpha_weight)
         } else {
-            i32::from(self.visible >> i & 1) * i32::from(self.colour_weight)
+            self.colour(i)
         }
+    }
+
+    /// The weight every colour channel of texel `i` shares.
+    #[inline]
+    pub fn colour(self, i: usize) -> i32 {
+        i32::from(self.visible >> i & 1) * i32::from(self.colour_weight)
+    }
+
+    /// Total weights `[colour, alpha]` of a representative set; every colour
+    /// channel has the first.
+    #[inline]
+    fn totals(self, reps: &super::Reps) -> [i32; 2] {
+        let mut n = [0; 2];
+        for (i, count) in reps.iter() {
+            n[0] += count * self.colour(i);
+            n[1] += count * i32::from(self.alpha_weight);
+        }
+        n
     }
 }
 
 // The bounded objectives use only weights 0, 1, 2 and 4; avoid libm in no_std.
+#[inline]
 fn root_weight(w: i32) -> f32 {
     match w {
         0 => 0.0,
@@ -98,24 +118,38 @@ pub(super) fn select_scalar<const C0: usize, const C1: usize>(
 // positive semidefinite seed covariance, not an invented invisible colour.
 fn moments<const C0: usize, const C1: usize>(px: &Block, reps: &Reps) -> ([f32; 4], [[f32; 4]; 4]) {
     let o = reps.objective.unwrap();
-    let mut mean = [0.0; 4];
-    for c in C0..C1 {
-        let mut n = 0;
-        let mut sum = 0;
-        for (i, count) in reps.iter() {
-            let w = count * o.weight(i, c);
-            n += w;
-            sum += w * i32::from(px[i][c]);
-        }
-        if n != 0 {
-            mean[c] = sum as f32 / n as f32;
+    let alpha = usize::from(o.alpha);
+    // Weights per class [colour, alpha]: colour channels share one per texel.
+    let mut n = [0; 2];
+    let mut sum = [0; 4];
+    for (i, count) in reps.iter() {
+        let w = [count * o.colour(i), count * i32::from(o.alpha_weight)];
+        n[0] += w[0];
+        n[1] += w[1];
+        for c in C0..C1 {
+            sum[c] += w[usize::from(c == alpha)] * i32::from(px[i][c]);
         }
     }
+    let mut mean = [0.0; 4];
+    for c in C0..C1 {
+        let n = n[usize::from(c == alpha)];
+        if n != 0 {
+            mean[c] = sum[c] as f32 / n as f32;
+        }
+    }
+    // root_weight of a visible colour, an invisible colour (weight 0) and alpha.
+    let roots = [
+        root_weight(i32::from(o.colour_weight)),
+        0.0,
+        root_weight(i32::from(o.alpha_weight)),
+    ];
     let mut cov = [[0.0; 4]; 4];
     for (i, count) in reps.iter() {
+        let seen = o.visible >> i & 1 == 1;
         let mut v = [0.0; 4];
         for c in C0..C1 {
-            v[c] = (f32::from(px[i][c]) - mean[c]) * root_weight(o.weight(i, c));
+            let root = roots[if c == alpha { 2 } else { usize::from(!seen) }];
+            v[c] = (f32::from(px[i][c]) - mean[c]) * root;
         }
         for c in C0..C1 {
             for e in C0..C1 {
@@ -262,6 +296,16 @@ impl SumTable {
     pub(super) fn rankings(&self) -> [[(f32, f32); 64]; 2] {
         let total = self.sums(0xffff);
         let mut out = [[(0f32, 0f32); 64]; 2];
+        #[cfg(feature = "simd")]
+        if self.rankings_simd(&total, &mut out) {
+            return out;
+        }
+        self.rankings_scalar(&total)
+    }
+
+    fn rankings_scalar(&self, total: &Sums) -> [[(f32, f32); 64]; 2] {
+        let total = *total;
+        let mut out = [[(0f32, 0f32); 64]; 2];
         for p in 0..64 {
             let one = self.sums(MASKS2[p][0]);
             let mut zero = total;
@@ -283,10 +327,96 @@ impl SumTable {
 
     /// RGB estimates of the first `count` three-subset partitions given by
     /// their subset masks; the rest stay unranked.
+    // The scalar estimates of `rankings`, a vector of partitions at a time;
+    // false (with `out` untouched) on the scalar backend.
+    #[cfg(feature = "simd")]
+    fn rankings_simd(&self, total: &Sums, out: &mut [[(f32, f32); 64]; 2]) -> bool {
+        let (cw, aw) = self.roots();
+        let width = simd::width();
+        for base in (0..64).step_by(width) {
+            let mut one = [[0i32; 17]; 8];
+            let mut zero = [[0i32; 17]; 8];
+            for l in 0..width {
+                one[l] = self.sums(MASKS2[base + l][0]);
+                for k in 0..17 {
+                    zero[l][k] = total[k] - one[l][k];
+                }
+            }
+            let (Some(z), Some(o)) = (
+                simd::weighted_estimates::<true>(&zero, cw, aw),
+                simd::weighted_estimates::<true>(&one, cw, aw),
+            ) else {
+                return false;
+            };
+            for l in 0..width {
+                for k in 0..2 {
+                    let slot = &mut out[k][base + l];
+                    slot.0 = 0.0 + z[k][l].0 + o[k][l].0;
+                    slot.1 = 0.0 + z[k][l].1 + o[k][l].1;
+                }
+            }
+        }
+        true
+    }
+
+    // `rankings3` a vector of subsets at a time; false on the scalar backend.
+    #[cfg(feature = "simd")]
+    fn rankings3_simd(
+        &self,
+        count: usize,
+        masks: &impl Fn(usize) -> [u16; 3],
+        out: &mut [(f32, f32); 64],
+    ) -> bool {
+        let (cw, aw) = self.roots();
+        let width = simd::width();
+        let mut estimates = [(0f32, 0f32); 3 * 64];
+        let subsets = 3 * count.min(64);
+        for base in (0..subsets).step_by(width) {
+            let mut sums = [[0i32; 17]; 8];
+            for l in 0..width.min(subsets - base) {
+                let k = base + l;
+                sums[l] = self.sums(masks(k / 3)[k % 3]);
+            }
+            let Some(e) = simd::weighted_estimates::<false>(&sums, cw, aw) else {
+                return false;
+            };
+            let filled = width.min(subsets - base);
+            estimates[base..base + filled].copy_from_slice(&e[0][..filled]);
+        }
+        for (p, slot) in out.iter_mut().enumerate().take(count) {
+            *slot = (0.0, 0.0);
+            for e in &estimates[3 * p..3 * p + 3] {
+                slot.0 += e.0;
+                slot.1 += e.1;
+            }
+        }
+        true
+    }
+
+    fn roots(&self) -> (f32, f32) {
+        (
+            root_weight(i32::from(self.o.colour_weight)),
+            root_weight(i32::from(self.o.alpha_weight)),
+        )
+    }
+
     pub(super) fn rankings3(
         &self,
         count: usize,
         masks: impl Fn(usize) -> [u16; 3],
+    ) -> [(f32, f32); 64] {
+        let mut out = [(f32::MAX, 0f32); 64];
+        #[cfg(feature = "simd")]
+        if self.rankings3_simd(count, &masks, &mut out) {
+            return out;
+        }
+        self.rankings3_scalar(count, &masks)
+    }
+
+    fn rankings3_scalar(
+        &self,
+        count: usize,
+        masks: &impl Fn(usize) -> [u16; 3],
     ) -> [(f32, f32); 64] {
         let mut out = [(f32::MAX, 0f32); 64];
         for (p, slot) in out.iter_mut().enumerate().take(count) {
@@ -298,6 +428,62 @@ impl SumTable {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Every backend's partition rankings carry the scalar estimates' bits,
+    // for any visibility, alpha range and colour weight the objective allows.
+    #[test]
+    fn vector_rankings_equal_scalar_bits() {
+        let mut state = 0x9e37_79b9u32;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state
+        };
+        for trial in 0..400 {
+            let spread = [255, 64, 7, 1][trial % 4];
+            let px: Block = core::array::from_fn(|_| {
+                core::array::from_fn(|_| (next() % 256).min(spread + next() % 3) as u8)
+            });
+            let o = Objective {
+                visible: if trial % 3 == 0 {
+                    u16::MAX
+                } else {
+                    next() as u16
+                },
+                alpha: 3,
+                alpha_weight: [1, 2, 4][trial % 3],
+                colour_weight: [1, 0, 2, 4][(trial / 3) % 4],
+            };
+            let table = SumTable::new(&px, o);
+            let total = table.sums(0xffff);
+            let pairs = |a: &[(f32, f32)], b: &[(f32, f32)]| {
+                for (x, y) in a.iter().zip(b) {
+                    assert_eq!(
+                        (x.0.to_bits(), x.1.to_bits()),
+                        (y.0.to_bits(), y.1.to_bits())
+                    );
+                }
+            };
+            let (vector, scalar) = (table.rankings(), table.rankings_scalar(&total));
+            for k in 0..2 {
+                pairs(&vector[k], &scalar[k]);
+            }
+            let masks = |p: usize| {
+                let [m1, m2] = crate::bc7::MASKS3[p];
+                [!(m1 | m2), m1, m2]
+            };
+            pairs(
+                &table.rankings3(16, masks),
+                &table.rankings3_scalar(16, &masks),
+            );
+        }
     }
 }
 
@@ -347,15 +533,31 @@ pub(super) fn targets<const C0: usize, const C1: usize>(px: &Block, reps: &Reps)
             v[c] = next[c] / largest;
         }
     }
-    // Project each observation using only its observed channels.
+    // Project each observation using only its observed channels. A texel's
+    // channel weights depend only on its visibility: [visible, invisible].
+    let mut weights = [[0.0f32; 4]; 2];
+    let mut dirs = [[0.0f32; 4]; 2];
+    for k in 0..2 {
+        for c in C0..C1 {
+            let w = if c == usize::from(o.alpha) {
+                i32::from(o.alpha_weight)
+            } else {
+                i32::from(k == 0) * i32::from(o.colour_weight)
+            };
+            weights[k][c] = w as f32;
+            dirs[k][c] = v[c] / root_weight(w.max(1));
+        }
+    }
     let mut lo = 0.0f32;
     let mut hi = 0.0f32;
     for (i, _) in reps.iter() {
+        let k = usize::from(o.visible >> i & 1 == 0);
+        let (weights, dirs) = (&weights[k], &dirs[k]);
         let mut dot = 0.0;
         let mut len = 0.0;
         for c in C0..C1 {
-            let w = o.weight(i, c) as f32;
-            let dir = v[c] / root_weight(o.weight(i, c).max(1));
+            let w = weights[c];
+            let dir = dirs[c];
             dot += w * (f32::from(px[i][c]) - mean[c]) * dir;
             len += w * dir * dir;
         }
@@ -385,24 +587,36 @@ pub(super) fn least_squares<const C0: usize, const C1: usize>(
     lv: &Levels,
 ) -> Option<Pair> {
     let o = reps.objective.unwrap();
+    let alpha = usize::from(o.alpha);
+    // Every colour channel shares one weight per texel, so the selector
+    // moments (aa, ab, bb, n) are summed once per weight class: [colour,
+    // alpha]. Integer sums over at most 16 texels of weight at most 64 per
+    // representative stay far inside i32; `det` widens to i64.
+    let mut shared = [[0i32; 4]; 2];
+    let mut sums = [[0i32; 3]; 4];
+    for (i, count) in reps.iter() {
+        let b = lv.w[usize::from(idx[i])];
+        let a = 64 - b;
+        let w = [count * o.colour(i), count * i32::from(o.alpha_weight)];
+        for k in 0..2 {
+            shared[k][0] += w[k] * a * a;
+            shared[k][1] += w[k] * a * b;
+            shared[k][2] += w[k] * b * b;
+            shared[k][3] += w[k];
+        }
+        for c in C0..C1 {
+            let w = w[usize::from(c == alpha)];
+            let x = i32::from(px[i][c]);
+            sums[c][0] += w * a * x;
+            sums[c][1] += w * b * x;
+            sums[c][2] += w * x;
+        }
+    }
     let mut t = [[0; 4]; 2];
     let mut fitted = false;
     for c in C0..C1 {
-        let (mut aa, mut ab, mut bb, mut ax, mut bx) = (0i64, 0i64, 0i64, 0i64, 0i64);
-        let (mut sum, mut n) = (0i64, 0i64);
-        for (i, count) in reps.iter() {
-            let w = i64::from(count * o.weight(i, c));
-            let b = i64::from(lv.w[usize::from(idx[i])]);
-            let a = 64 - b;
-            let x = i64::from(px[i][c]);
-            aa += w * a * a;
-            ab += w * a * b;
-            bb += w * b * b;
-            ax += w * a * x;
-            bx += w * b * x;
-            sum += w * x;
-            n += w;
-        }
+        let [aa, ab, bb, n] = shared[usize::from(c == alpha)].map(i64::from);
+        let [ax, bx, sum] = sums[c].map(i64::from);
         let det = aa * bb - ab * ab;
         if det != 0 {
             let scale = 64.0 / det as f64;
@@ -429,10 +643,11 @@ pub(super) fn quantize<const C0: usize, const C1: usize>(
         return super::quantize::<C0, C1>(t, prec, force_p1);
     }
     let o = reps.objective.unwrap();
+    let totals = o.totals(reps);
     let error = |k: usize, p: usize| {
         let mut err = 0;
         for c in C0..C1 {
-            let n: i32 = reps.iter().map(|(i, count)| count * o.weight(i, c)).sum();
+            let n = totals[usize::from(c == usize::from(o.alpha))];
             let x = t[k][c] - i32::from(QUANT[prec.bits][p][t[k][c] as usize]);
             err += n * x * x;
         }

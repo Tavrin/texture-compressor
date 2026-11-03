@@ -282,6 +282,18 @@ pub(super) fn partition_estimates<const CH: usize>(
     true
 }
 
+/// RGB and (when `RGBA`) RGBA principal estimates of the first `width()`
+/// weighted texel sets, equal to `objective::SumTable`'s scalar estimates;
+/// `None` on the scalar backend.
+pub(super) fn weighted_estimates<const RGBA: bool>(
+    sums: &[[i32; 17]; 8],
+    cw: f32,
+    aw: f32,
+) -> Option<[[(f32, f32); 8]; 2]> {
+    let _ = (&sums, &cw, &aw);
+    dispatch!(level(), weighted_estimates::<RGBA>, sums, cw, aw)
+}
+
 pub(crate) fn hdr_distances(src: &[[[f64; 8]; 16]; 3]) -> [[[f64; 16]; 16]; 8] {
     match level() {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
