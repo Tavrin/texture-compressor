@@ -12,107 +12,105 @@ macro_rules! kernels {
             limit: u32,
             objective: Option<objective::Objective>,
         ) -> u32 {
-            if objective.is_some() {
-                select_levels::<C0, C1, true>(px, reps, d, lv, idx, limit, objective)
-            } else {
-                select_levels::<C0, C1, false>(px, reps, d, lv, idx, limit, objective)
+            debug_assert!(matches!(lv.w.len(), 4 | 8 | 16));
+            match (lv.w.len(), objective) {
+                (4, None) => select_window::<C0, C1, 4>(px, reps, d, idx, limit),
+                (8, None) => select_window::<C0, C1, 8>(px, reps, d, idx, limit),
+                (_, None) => select_window::<C0, C1, 16>(px, reps, d, idx, limit),
+                (4, Some(o)) => select_full::<C0, C1, 4>(px, reps, d, idx, limit, o),
+                (8, Some(o)) => select_full::<C0, C1, 8>(px, reps, d, idx, limit, o),
+                (_, Some(o)) => select_full::<C0, C1, 16>(px, reps, d, idx, limit, o),
             }
         }
 
+        // One element per representative ($n representatives per vector).
+        // Pixels, palette entries and thresholds are byte tables indexed
+        // per element; only the ordered error accumulation and its cutoff stay
+        // scalar, so partial selector prefixes match the scalar selector.
         #[target_feature(enable = $feature)]
-        fn select_levels<const C0: usize, const C1: usize, const WEIGHTED: bool>(
+        fn select_window<const C0: usize, const C1: usize, const N: usize>(
             px: &Block,
             reps: &Reps,
             d: &Pair,
-            lv: &Levels,
             idx: &mut [u8; 16],
             limit: u32,
-            objective: Option<objective::Objective>,
         ) -> u32 {
-            match lv.w.len() {
-                4 => select_inner::<C0, C1, WEIGHTED, 4, { 4 + $n }>(
-                    px, reps, d, lv, idx, limit, objective,
-                ),
-                8 => select_inner::<C0, C1, WEIGHTED, 8, { 8 + $n }>(
-                    px, reps, d, lv, idx, limit, objective,
-                ),
-                16 => select_inner::<C0, C1, WEIGHTED, 16, { 16 + $n }>(
-                    px, reps, d, lv, idx, limit, objective,
-                ),
-                _ => unreachable!(),
-            }
-        }
-
-        #[target_feature(enable = $feature)]
-        fn select_inner<
-            const C0: usize,
-            const C1: usize,
-            const WEIGHTED: bool,
-            const N: usize,
-            const PAD: usize,
-        >(
-            px: &Block,
-            reps: &Reps,
-            d: &Pair,
-            lv: &Levels,
-            idx: &mut [u8; 16],
-            limit: u32,
-            objective: Option<objective::Objective>,
-        ) -> u32 {
-            let n = N;
-            debug_assert_eq!(lv.w.len(), N);
-            debug_assert!(PAD >= N + $n);
-            let mut palette = [[0; PAD]; 4];
+            let (weights, thresholds) = level_tables(N);
+            let planes = planes(px);
+            let mut palette = [planes[0]; 4];
             let mut dir = [0; 4];
             let mut len2 = 0;
             for c in C0..C1 {
                 dir[c] = d[1][c] - d[0][c];
                 len2 += dir[c] * dir[c];
-                for j in 0..N {
-                    let w = lv.w[j];
-                    palette[c][j] = ((64 - w) * d[0][c] + w * d[1][c] + 32) >> 6;
-                }
+                palette[c] = palette_table::<N>(weights, d[0][c], d[1][c]);
             }
-            let scale = if len2 == 0 { 0.0 } else { 64.0 / len2 as f32 };
-            let mut err = 0;
-            for (i, count) in reps.iter() {
-                let (start, end) = if WEIGHTED {
-                    (0, n)
-                } else {
-                    let mut t = 0;
-                    for c in C0..C1 {
-                        t += (i32::from(px[i][c]) - d[0][c]) * dir[c];
+            let scale = fsplat(if len2 == 0 { 0.0 } else { 64.0 / len2 as f32 });
+            let ids = bytes(&reps.ids);
+            let thresholds = bytes(thresholds);
+            let iota = load(&core::array::from_fn(|l| l as i32));
+            let last = splat(N as i32 - 1);
+            let mut err = 0u32;
+            let mut base = 0;
+            while base < reps.len {
+                let r = lookup(ids, add(splat(base as i32), iota));
+                let p: [_; 4] = core::array::from_fn(|c| {
+                    if (C0..C1).contains(&c) {
+                        lookup(planes[c], r)
+                    } else {
+                        splat(0)
                     }
-                    let k = ((t as f32 * scale + 0.5) as i32).clamp(0, 64) as usize;
-                    let j = usize::from(lv.near[k]);
-                    (j.saturating_sub(1), (j + 2).min(n))
-                };
-                let mut best = (i32::MAX, 0);
-                for base in (start..end).step_by($n) {
+                });
+                // The scalar projection: integer dot product, then the same
+                // f32 multiply and add, truncation and clamp.
+                let mut t = splat(0);
+                for c in C0..C1 {
+                    t = add(t, mul(sub(p[c], splat(d[0][c])), splat(dir[c])));
+                }
+                let k = to_int(fadd(fmul(to_float(t), scale), fsplat(0.5)));
+                let k = vmin(vmax(k, splat(0)), splat(64));
+                // Nearest entry: a guess g within one of it (checked at
+                // compile time), corrected by the two midpoint thresholds
+                // around g. Compare masks are -1 where true.
+                let g = vmin(vmax(shr6(add(mul(k, last), splat(32))), splat(1)), last);
+                let twice = add(k, k);
+                let below = sub(g, splat(1));
+                let j = sub(
+                    sub(below, gt(twice, lookup(thresholds, below))),
+                    gt(twice, lookup(thresholds, g)),
+                );
+                let start = vmax(sub(j, splat(1)), splat(0));
+                let end = vmin(add(j, splat(2)), splat(N as i32));
+                let mut best = splat(0);
+                let mut best_index = start;
+                for offset in 0..3 {
+                    // Entries past the window may wrap in the table lookup;
+                    // `end` excludes them before any comparison counts.
+                    let choice = add(start, splat(offset));
                     let mut e = splat(0);
                     for c in C0..C1 {
-                        let values: [i32; $n] = palette[c][base..base + $n].try_into().unwrap();
-                        let diff = sub(splat(i32::from(px[i][c])), load(&values));
-                        let square = mul(diff, diff);
-                        let term = if WEIGHTED {
-                            mul(square, splat(objective.unwrap().weight(i, c)))
-                        } else {
-                            square
-                        };
-                        e = add(e, term);
+                        let diff = sub(p[c], lookup(palette[c], choice));
+                        e = add(e, mul(diff, diff));
                     }
-                    let errors = store(e);
-                    for slot in 0..(end - base).min($n) {
-                        if errors[slot] < best.0 {
-                            best = (errors[slot], base + slot);
-                        }
+                    if offset == 0 {
+                        best = e;
+                    } else {
+                        let better = and(gt(end, choice), gt(best, e));
+                        best = blend(better, e, best);
+                        best_index = blend(better, choice, best_index);
                     }
                 }
-                idx[i] = best.1 as u8;
-                err += (best.0 * count) as u32;
-                if err >= limit {
-                    return err;
+                let errors = store(best);
+                let chosen = store(best_index);
+                for l in 0..(reps.len - base).min($n) {
+                    let rep = base + l;
+                    idx[usize::from(reps.ids[rep])] = chosen[l] as u8;
+                    err += (errors[l] * i32::from(reps.counts[rep])) as u32;
+                    if err >= limit {
+                        return err;
+                    }
                 }
+                base += $n;
             }
             if reps.expand {
                 for i in 0..16 {
@@ -120,6 +118,107 @@ macro_rules! kernels {
                 }
             }
             err
+        }
+
+        // Weighted selectors scan the full palette in ascending order for
+        // $n representatives at once. Colour channels share one weight per
+        // texel, so Σ w·x² = colour·Σ x² + alpha·x_alpha² exactly.
+        #[target_feature(enable = $feature)]
+        fn select_full<const C0: usize, const C1: usize, const N: usize>(
+            px: &Block,
+            reps: &Reps,
+            d: &Pair,
+            idx: &mut [u8; 16],
+            limit: u32,
+            o: objective::Objective,
+        ) -> u32 {
+            let (weights, _) = level_tables(N);
+            let planes = planes(px);
+            let mut palette = [[0; 16]; 4];
+            for c in C0..C1 {
+                for j in 0..N {
+                    let w = weights[j];
+                    palette[c][j] = ((64 - w) * d[0][c] + w * d[1][c] + 32) >> 6;
+                }
+            }
+            let ids = bytes(&reps.ids);
+            let (low, high) = (bytes(&VISIBLE_LOW), bytes(&VISIBLE_HIGH));
+            let visible_low = splat(i32::from(o.visible & 0xff));
+            let visible_high = splat(i32::from(o.visible >> 8));
+            let alpha = usize::from(o.alpha);
+            let alpha_weight = splat(i32::from(o.alpha_weight));
+            let iota = load(&core::array::from_fn(|l| l as i32));
+            let mut err = 0u32;
+            let mut base = 0;
+            while base < reps.len {
+                let r = lookup(ids, add(splat(base as i32), iota));
+                let p: [_; 4] = core::array::from_fn(|c| {
+                    if (C0..C1).contains(&c) {
+                        lookup(planes[c], r)
+                    } else {
+                        splat(0)
+                    }
+                });
+                let seen = or(
+                    and(lookup(low, r), visible_low),
+                    and(lookup(high, r), visible_high),
+                );
+                let colour_weight = mul(vmin(seen, splat(1)), splat(i32::from(o.colour_weight)));
+                let mut best = splat(i32::MAX);
+                let mut best_index = splat(0);
+                for j in 0..N {
+                    let mut colour = splat(0);
+                    let mut opacity = splat(0);
+                    for c in C0..C1 {
+                        let diff = sub(p[c], splat(palette[c][j]));
+                        if c == alpha {
+                            opacity = mul(diff, diff);
+                        } else {
+                            colour = add(colour, mul(diff, diff));
+                        }
+                    }
+                    let e = add(mul(colour, colour_weight), mul(opacity, alpha_weight));
+                    let better = gt(best, e);
+                    best = blend(better, e, best);
+                    best_index = blend(better, splat(j as i32), best_index);
+                }
+                let errors = store(best);
+                let chosen = store(best_index);
+                for l in 0..(reps.len - base).min($n) {
+                    let rep = base + l;
+                    idx[usize::from(reps.ids[rep])] = chosen[l] as u8;
+                    err += (errors[l] * i32::from(reps.counts[rep])) as u32;
+                    if err >= limit {
+                        return err;
+                    }
+                }
+                base += $n;
+            }
+            if reps.expand {
+                for i in 0..16 {
+                    idx[i] = idx[usize::from(reps.of[i])];
+                }
+            }
+            err
+        }
+
+        // The 16-entry palette of one channel as a byte table; entries at
+        // and after N are never eligible.
+        #[target_feature(enable = $feature)]
+        fn palette_table<const N: usize>(weights: &[i32; 16], d0: i32, d1: i32) -> Table {
+            let (chunks, _) = weights.as_chunks::<$n>();
+            let entries: [_; 16 / $n] = core::array::from_fn(|q| {
+                if q * $n < N {
+                    let w = load(&chunks[q]);
+                    shr6(add(
+                        add(mul(sub(splat(64), w), splat(d0)), mul(w, splat(d1))),
+                        splat(32),
+                    ))
+                } else {
+                    splat(0)
+                }
+            });
+            pack(entries)
         }
 
         #[target_feature(enable = $feature)]
@@ -405,8 +504,15 @@ macro_rules! kernels {
 
         #[target_feature(enable = $feature)]
         pub(super) fn estimates<const CH: usize>(moments: &[Moments; 8]) -> [(f32, f32); 8] {
-            let m: [_; 15] =
-                core::array::from_fn(|k| load(&core::array::from_fn(|l| moments[l].m[k])));
+            // Only the count, sums and products of CH channels are read.
+            let used = 1 + CH + CH * (CH + 1) / 2;
+            let m: [_; 15] = core::array::from_fn(|k| {
+                if k < used {
+                    load(&core::array::from_fn(|l| moments[l].m[k]))
+                } else {
+                    splat(0)
+                }
+            });
             let mut cov = [[fsplat(0.0); 4]; 4];
             let mut trace = fsplat(0.0);
             let mut k = 1 + CH;

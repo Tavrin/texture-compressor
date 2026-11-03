@@ -1,5 +1,21 @@
 # Changelog
 
+## [Unreleased]
+
+## [0.2.1] - 2026-11-03
+
+### Changed
+
+- BC7 Balanced and Quality now spend a fixed per-block work budget instead of
+  adapting effort to block difficulty, so encode time no longer depends on how
+  hard the content is. Candidates are chosen by cheap estimates, partition
+  ranking and the palette selector run across several representatives per
+  vector (SSE4.1, AVX2, NEON and wasm simd128 paths), and the mode 2 search is
+  removed; no preset emits BC7 mode 2 (the decoder still reads it). Balanced and
+  Quality output bytes change. Fast output is unchanged on the identity sample.
+  Output stays identical across SIMD levels, thread counts and native/wasm.
+- No BC7 performance claim is made for this change.
+
 ## [0.2.0] - 2026-10-31
 
 ### Added

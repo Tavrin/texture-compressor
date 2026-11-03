@@ -12,6 +12,7 @@ libfuzzer-sys = "0.4"
 
 [dependencies.texture-compressor]
 path = ".."
+features = ["simd-diagnostics"]
 
 [workspace]
 
@@ -32,6 +33,13 @@ bench = false
 [[bin]]
 name = "bc5_peak"
 path = "fuzz_targets/bc5_peak.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bc7_encode"
+path = "fuzz_targets/bc7_encode.rs"
 test = false
 doc = false
 bench = false

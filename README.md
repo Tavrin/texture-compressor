@@ -125,7 +125,14 @@ On other measured sets:
   0.03 dB.
   There is no BC6H speed claim: Intel is faster at every preset.
 
-BC1, BC3 and BC7, at all presets, are provided without performance claims.
+- BC7 Quality, on a separate sealed set of 40 CC0 textures, encodes in 0.99x
+  the single-thread wall time of Intel ISPC's basic preset (pooled; worst
+  texture 1.10x), with no texture losing more than 0.1 dB PSNR or 0.001 SSIM
+  against Intel on visible texels.
+
+BC7 Balanced is faster than Intel's basic preset on the same set (0.79x
+pooled, worst texture 0.89x), but loses 0.66 dB on one fence texture, so it
+carries no claim. BC1, BC3 and BC7 Fast are provided without performance claims.
 BC4 and BC5 Fast and Quality are provided without performance claims.
 
 ## How claims are measured
@@ -145,7 +152,7 @@ multi-thread performance or quality on every unseen texture.
 
 ### Fuzzing
 
-`fuzz/` holds three libFuzzer targets (run with `cargo +nightly fuzz run
+`fuzz/` holds four libFuzzer targets (run with `cargo +nightly fuzz run
 <target>` from the repository root; seed corpora are in `fuzz/corpus/`):
 
 - `bc6h_encode`: arbitrary f32 and binary16 bit patterns (NaN, infinities,
@@ -157,6 +164,18 @@ multi-thread performance or quality on every unseen texture.
 - `bc5_peak`: BC4 and BC5 `PeakBounded` at every preset on strided R8, RG8 and
   RGBA8 input. Checks determinism and that no block channel's peak byte error
   exceeds the range fit's, with a separate round-to-nearest BC4 decoder.
+- `bc7_encode`: BC7 Fast, Balanced and Quality on RGBA8 images up to 23x23
+  texels (strided, non-multiple-of-four) with opaque, cutout, transparent,
+  near-opaque, near-transparent and noise alpha, and raw, few-colour and ramp
+  colour. Checks that every block has a legal mode and decodes through the
+  independent reference decoder in `tests/bc7_decoder.rs`, that `encode` equals
+  `encode_into` and repeats, and that the first full block encodes identically
+  alone and inside the image. With `BC7_DIGEST_LOG=<file>` it logs input and
+  output digests, so a corpus replay under `TEXENC_SIMD=scalar` (build with
+  `simd-diagnostics`, which the fuzz crate enables) can be compared with the
+  dispatched backend byte for byte. Inputs whose first byte has the high bit
+  set use a layout built for mutation: low bits choose Balanced or Quality, the
+  rest is RGBA8 texels, 64 bytes per 4x4 block, up to six blocks in a row.
 
 Method: cargo-fuzz 0.13.2, rustc 1.101.0-nightly (2026-10-04), AddressSanitizer,
 debug assertions and overflow checks on, x86_64 with runtime-dispatched
@@ -170,6 +189,26 @@ added no coverage, then once more with `-rss_limit_mb=512`.
 | `bc6h_encode` | 3 x 601 | 214,487 | 878 | `bc6h.rs` 93%, `hdr.rs` 88% of lines | 0 |
 | `bc6h_decode` | 3 x 601 | 105,134,469 | 235 | decoder paths (`bc6h.rs` 22%, `hdr.rs` 4% of lines) | 0 |
 | `bc5_peak` | 3 x 601 | 787,474 | 908 | `bc4.rs` 82% of lines | 0 |
+| `bc7_encode` | 4 + 5 x 600 | 852,839 | 4,948 | `bc7_search.rs` 89%, `bc7_objective.rs` 79%, `bc7_fast.rs` 69%, `bc7_simd/avx2.rs` 87% of lines (seed replay) | 0 |
+
+`bc7_encode` reach was measured first by replaying 120 generated seeds with LLVM
+coverage: `bc7_search.rs` 25% of lines, `bc7_fast.rs` 73%, `bc7_objective.rs`
+81%. Four 600 s segments from those seeds reached 4,930 edges (the last two
+flat). `bc7_search.rs` holds the Balanced and Quality search, so the corpus was
+then seeded with 1,500 inputs in the raw layout (a byte with the high bit set
+whose low bits select Balanced or Quality, then 64 bytes of RGBA8 per 4x4
+block): 150 real blocks per cohort, each at both presets, cut from development
+textures (the training set and the second held-out set only). The cohorts are
+detailed opaque, cutout, saturated, smooth gradient and alpha-blended (a ramp
+alpha put on detailed blocks). Replaying only those seeds took `bc7_search.rs`
+from 25% to 89% of lines, `budget.rs` to 93% and `avx2.rs` to 87%. Five more
+600 s segments from the combined corpus reached 4,948 edges: 4,947 after the
+first, 4,948 after the third, none added in the fourth and fifth. All segments
+used `-rss_limit_mb=512` and exited 0. The final corpus (1,606 inputs) was
+replayed with `-runs=0` under `TEXENC_SIMD=scalar`, `sse41`, `avx2` and the
+default dispatch on an AVX2 machine: 1,605 inputs each, exit 0, and the sorted
+per-input output digests of the four runs are identical. No panic, overflow,
+illegal block or mismatch was found.
 
 Every run exited 0 (including the 512 MB runs). The first `bc5_peak` run stopped
 on its own check: the target's reference decoder truncated BC4 interpolants,

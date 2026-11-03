@@ -50,6 +50,7 @@ fn level() -> u8 {
 /// Whether SSE4.1 itself is reported, checked separately from AVX2 detection
 /// before a forced or test-selected SSE4.1 call.
 #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[cfg_attr(not(any(test, feature = "simd-diagnostics")), allow(dead_code))]
 fn sse41_detected() -> bool {
     std::arch::is_x86_feature_detected!("sse4.1")
 }
@@ -97,22 +98,11 @@ pub(super) fn select<const C0: usize, const C1: usize>(
     limit: u32,
     objective: Option<objective::Objective>,
 ) -> Option<u32> {
-    // Short unweighted fits do not amortize SIMD staging and dispatch.
-    // The caller retains the same scalar error, tie and cutoff rules.
-    if objective.is_none() && reps.len <= 4 {
-        return None;
-    }
+    // Every fit length uses the vector selector: one batch already covers
+    // up to 4 or 8 representatives (short fits measured faster too).
     let _ = (&px, &reps, &d, &lv, &idx, &limit, &objective);
-    let selected = level();
-    // An unweighted selector checks at most three neighbouring entries.
-    // Four lanes suffice; retain eight lanes for weighted full palettes.
-    // AVX2 is not used as evidence of SSE4.1: check that feature explicitly.
-    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
-    if selected == 2 && objective.is_none() && sse41_detected() {
-        return dispatch!(1, select::<C0, C1>, px, reps, d, lv, idx, limit, objective);
-    }
     dispatch!(
-        selected,
+        level(),
         select::<C0, C1>,
         px,
         reps,
@@ -123,6 +113,126 @@ pub(super) fn select<const C0: usize, const C1: usize>(
         objective
     )
 }
+
+// Selector tables: the weights padded to 16 entries, and the midpoint
+// thresholds w[m-1] + w[m] at index m - 1 (m = 1..N-1) with 255 at N - 1.
+// Twice the projection exceeds threshold m exactly when entry m is nearer
+// than entry m - 1, so the nearest entry counts the thresholds exceeded.
+#[cfg_attr(
+    not(any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    )),
+    allow(dead_code)
+)]
+const fn padded<const N: usize>(w: [i32; N]) -> [i32; 16] {
+    let mut out = [0; 16];
+    let mut j = 0;
+    while j < N {
+        out[j] = w[j];
+        j += 1;
+    }
+    out
+}
+const fn thresholds<const N: usize>(w: [i32; N]) -> [u8; 16] {
+    let mut out = [0; 16];
+    let mut m = 1;
+    while m < N {
+        out[m - 1] = (w[m - 1] + w[m]) as u8;
+        m += 1;
+    }
+    out[N - 1] = 255;
+    out
+}
+// The kernels guess g = clamp((k(N-1) + 32) >> 6, 1, N-1) and count only
+// thresholds g and g + 1; this holds when the nearest entry (the `nearest`
+// table the scalar selector reads) is within one of g for every k.
+const fn guess_within_one<const N: usize>(w: [i32; N]) -> bool {
+    let table = nearest(w);
+    let t = thresholds(w);
+    let mut k = 0;
+    while k <= 64 {
+        let mut g = (k * (N - 1) + 32) >> 6;
+        if g < 1 {
+            g = 1;
+        }
+        if g > N - 1 {
+            g = N - 1;
+        }
+        let near = table[k] as usize;
+        if near + 1 < g || near > g + 1 {
+            return false;
+        }
+        let j = g - 1 + (2 * k > t[g - 1] as usize) as usize + (2 * k > t[g] as usize) as usize;
+        if j != near {
+            return false;
+        }
+        k += 1;
+    }
+    true
+}
+const _: () = assert!(guess_within_one(W2) && guess_within_one(W3) && guess_within_one(W4));
+#[cfg_attr(
+    not(any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    )),
+    allow(dead_code)
+)]
+static WEIGHTS: [[i32; 16]; 3] = [padded(W2), padded(W3), padded(W4)];
+#[cfg_attr(
+    not(any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    )),
+    allow(dead_code)
+)]
+static THRESHOLDS: [[u8; 16]; 3] = [thresholds(W2), thresholds(W3), thresholds(W4)];
+#[cfg_attr(
+    not(any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    )),
+    allow(dead_code)
+)]
+fn level_tables(n: usize) -> (&'static [i32; 16], &'static [u8; 16]) {
+    let slot = match n {
+        4 => 0,
+        8 => 1,
+        _ => 2,
+    };
+    (&WEIGHTS[slot], &THRESHOLDS[slot])
+}
+// Visibility bit i of a u16 mask, split by byte: bit i of the low byte for
+// texels 0..8 and of the high byte for texels 8..16.
+#[cfg_attr(
+    not(any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    )),
+    allow(dead_code)
+)]
+static VISIBLE_LOW: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 0, 0, 0, 0, 0, 0, 0, 0];
+#[cfg_attr(
+    not(any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    )),
+    allow(dead_code)
+)]
+static VISIBLE_HIGH: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 4, 8, 16, 32, 64, 128];
 pub(super) fn polish<const C0: usize, const C1: usize>(
     px: &Block,
     reps: &Reps,
@@ -139,9 +249,13 @@ pub(super) fn polish<const C0: usize, const C1: usize>(
     let _ = (&px, &reps, &f, &prec, &lv, &objective);
     dispatch!(level(), polish::<C0, C1>, px, reps, f, prec, lv, objective)
 }
+// Every batch reads eight lanes in place; the padded arrays hold them.
+const LANES: usize = super::search::PARTITION_LANES;
+const _: () = assert!(LANES >= 64 - 4 + 8);
 pub(super) fn partition_estimates<const CH: usize>(
     out: &mut [(f32, f32); 64],
-    subsets: impl Fn(usize) -> [Moments; 2],
+    zero: &[Moments; LANES],
+    one: &[Moments; LANES],
 ) -> bool {
     let selected = level();
     if selected == 0 {
@@ -149,12 +263,18 @@ pub(super) fn partition_estimates<const CH: usize>(
     }
     let width = if selected == 2 { 8 } else { 4 };
     for base in (0..64).step_by(width) {
-        let parts: [_; 8] = core::array::from_fn(|l| subsets((base + l).min(63)));
-        let zero = parts.map(|p| p[0]);
-        let one = parts.map(|p| p[1]);
-        let _ = (&zero, &one);
-        let a: [(f32, f32); 8] = dispatch!(selected, estimates::<CH>, &zero).unwrap();
-        let b: [(f32, f32); 8] = dispatch!(selected, estimates::<CH>, &one).unwrap();
+        let (Some(z), Some(o)) = (
+            zero[base..].first_chunk::<8>(),
+            one[base..].first_chunk::<8>(),
+        ) else {
+            return false;
+        };
+        let _ = (&z, &o);
+        let a: Option<[(f32, f32); 8]> = dispatch!(selected, estimates::<CH>, z);
+        let b: Option<[(f32, f32); 8]> = dispatch!(selected, estimates::<CH>, o);
+        let (Some(a), Some(b)) = (a, b) else {
+            return false;
+        };
         for l in 0..width {
             out[base + l] = (a[l].0 + b[l].0, a[l].1 + b[l].1);
         }
@@ -267,6 +387,9 @@ mod tests {
                             0
                         } else if trial == 1 {
                             255
+                        } else if trial % 3 == 2 {
+                            // Few distinct colours: duplicate representatives.
+                            rng as u8 & 0x80
                         } else {
                             rng as u8
                         }
@@ -294,64 +417,86 @@ mod tests {
                 for px in &blocks {
                     let reps =
                         Reps::distinct(px).masked(if trial % 2 == 0 { 0xffff } else { 0x5317 });
-                    let d = [[0, 31, 127, 255], [255, 77, 11, 0]];
-                    for lv in [&L2, &L3, &L4] {
-                        for limit in [0, 1, 257, 100000, u32::MAX] {
-                            let mut scalar = [91; 16];
-                            let mut vector = scalar;
-                            let a = select_scalar::<0, 4>(px, &reps, &d, lv, &mut scalar, limit);
-                            let b = dispatch!(
-                                backend,
-                                select::<C0, C1>,
-                                px,
-                                &reps,
-                                &d,
-                                lv,
-                                &mut vector,
-                                limit,
-                                None
-                            );
-                            // The generic arguments below are constants bound
-                            // locally to keep the shared dispatch macro simple.
-                            assert_eq!(Some(a), b);
-                            assert_eq!(scalar, vector);
+                    for d in pairs(px) {
+                        for lv in [&L2, &L3, &L4] {
+                            for limit in [0, 1, 257, 100000, u32::MAX] {
+                                let mut scalar = [91; 16];
+                                let mut vector = scalar;
+                                let a =
+                                    select_scalar::<0, 4>(px, &reps, &d, lv, &mut scalar, limit);
+                                let b = dispatch!(
+                                    backend,
+                                    select::<C0, C1>,
+                                    px,
+                                    &reps,
+                                    &d,
+                                    lv,
+                                    &mut vector,
+                                    limit,
+                                    None
+                                );
+                                // The generic arguments are constants bound
+                                // locally to keep the shared dispatch macro simple.
+                                assert_eq!(Some(a), b);
+                                assert_eq!(scalar, vector);
+                                let mut scalar = [91; 16];
+                                let mut vector = scalar;
+                                let a =
+                                    select_scalar::<0, 3>(px, &reps, &d, lv, &mut scalar, limit);
+                                let b = dispatch!(
+                                    backend,
+                                    select::<C0, CH>,
+                                    px,
+                                    &reps,
+                                    &d,
+                                    lv,
+                                    &mut vector,
+                                    limit,
+                                    None
+                                );
+                                assert_eq!(Some(a), b);
+                                assert_eq!(scalar, vector);
+                            }
                         }
                     }
                 }
                 for px in &blocks {
                     let mut reps = objective::Reps::distinct(px);
+                    let weights = [0, 1, 2, 4];
                     let o = objective::Objective {
-                        visible: 0x57a3,
-                        alpha: 2,
-                        alpha_weight: 4,
+                        visible: 0x57a3 ^ (trial as u16).wrapping_mul(0x1111),
+                        alpha: (trial % 4) as u8,
+                        alpha_weight: weights[trial % 4],
+                        colour_weight: weights[(trial / 4) % 3 + 1],
                     };
                     reps.objective = Some(o);
-                    let d = [[0, 31, 127, 255], [255, 77, 11, 0]];
-                    for lv in [&L2, &L3, &L4] {
-                        for limit in [0, 1, 1000, u32::MAX] {
-                            let mut scalar = [91; 16];
-                            let mut vector = scalar;
-                            let a = objective::select_scalar::<0, 4>(
-                                px,
-                                &reps,
-                                &d,
-                                lv,
-                                &mut scalar,
-                                limit,
-                            );
-                            let b = dispatch!(
-                                backend,
-                                select::<C0, C1>,
-                                px,
-                                &reps,
-                                &d,
-                                lv,
-                                &mut vector,
-                                limit,
-                                Some(o)
-                            );
-                            assert_eq!(Some(a), b);
-                            assert_eq!(scalar, vector);
+                    for d in pairs(px) {
+                        for lv in [&L2, &L3, &L4] {
+                            for limit in [0, 1, 1000, u32::MAX] {
+                                let mut scalar = [91; 16];
+                                let mut vector = scalar;
+                                let a = objective::select_scalar::<0, 4>(
+                                    px,
+                                    &reps,
+                                    &d,
+                                    lv,
+                                    &mut scalar,
+                                    limit,
+                                );
+                                let b = dispatch!(
+                                    backend,
+                                    select::<C0, C1>,
+                                    px,
+                                    &reps,
+                                    &d,
+                                    lv,
+                                    &mut vector,
+                                    limit,
+                                    Some(o)
+                                );
+                                assert_eq!(Some(a), b);
+                                assert_eq!(scalar, vector);
+                            }
                         }
                     }
                 }
@@ -373,6 +518,15 @@ mod tests {
                 }
             }
         }
+    }
+    // A fixed pair, a pair drawn from the block, and a zero-length pair.
+    fn pairs(px: &Block) -> [Pair; 3] {
+        let pixel = |i: usize| px[i].map(i32::from);
+        [
+            [[0, 31, 127, 255], [255, 77, 11, 0]],
+            [pixel(3), pixel(9)],
+            [pixel(5), pixel(5)],
+        ]
     }
     const C0: usize = 0;
     const C1: usize = 4;
