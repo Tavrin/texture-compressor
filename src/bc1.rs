@@ -367,7 +367,8 @@ fn fast(px: &[[u8; 4]; 16], trans: Option<u8>, lo: [i32; 3], hi: [i32; 3]) -> ([
 
 pub fn encode(px: &[[u8; 4]; 16], effort: Effort, policy: AlphaPolicy) -> [u8; 8] {
     let trans = match policy {
-        AlphaPolicy::Opaque => None,
+        // Validation admits only BC7 for the BC7 policy.
+        AlphaPolicy::Opaque | AlphaPolicy::IgnoreTransparentColour => None,
         AlphaPolicy::PunchThrough { threshold } => Some(threshold),
     };
     let mut best = (u32::MAX, 0u16, 0u16, 0u32);

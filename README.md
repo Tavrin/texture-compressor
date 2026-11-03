@@ -45,6 +45,14 @@ assert_eq!(blocks.len(), 16);
 # Ok::<(), texture_compressor::Error>(())
 ```
 
+BC7 treats alpha as straight (unassociated): colour error counts on every
+texel, including texels whose alpha is zero, because filtering, mipmapping or
+later premultiplication can still read that colour. For premultiplied input,
+or cutouts whose transparent texels are never filtered,
+`with_alpha(AlphaPolicy::IgnoreTransparentColour)` stops Balanced and Quality
+from scoring that colour (it may then decode black) and spends the precision
+on visible texels instead.
+
 ### Single channel to BC4
 
 ```rust
@@ -125,15 +133,11 @@ On other measured sets:
   0.03 dB.
   There is no BC6H speed claim: Intel is faster at every preset.
 
-- BC7 Quality, on a separate sealed set of 40 CC0 textures, encodes in 0.99x
-  the single-thread wall time of Intel ISPC's basic preset (pooled; worst
-  texture 1.10x), with no texture losing more than 0.1 dB PSNR or 0.001 SSIM
-  against Intel on visible texels.
-
-BC7 Balanced is faster than Intel's basic preset on the same set (0.79x
-pooled, worst texture 0.89x), but loses 0.66 dB on one fence texture, so it
-carries no claim. BC1, BC3 and BC7 Fast are provided without performance claims.
-BC4 and BC5 Fast and Quality are provided without performance claims.
+BC7 has no performance claim. The earlier BC7 Quality result scored colour
+only on texels with nonzero alpha; BC7 now scores colour on every texel by
+default (straight alpha), so that result no longer describes the default
+encoder. A new claim needs a new sealed test set. BC1 and BC3 are provided
+without performance claims, and so are BC4 and BC5 Fast and Quality.
 
 ## How claims are measured
 

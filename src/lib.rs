@@ -43,17 +43,30 @@ pub enum Effort {
     /// including three-subset modes, and extra endpoint refinement.
     Quality,
 }
-/// Alpha handling; punch-through is supported only for BC1.
+/// Alpha handling; punch-through is supported only for BC1 and
+/// [`AlphaPolicy::IgnoreTransparentColour`] only for BC7.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AlphaPolicy {
-    /// Opaque BC1 blocks. BC3 and BC7 preserve input alpha with this policy.
+    /// Opaque BC1 blocks. BC3 and BC7 preserve input alpha with this policy
+    /// and treat it as straight (unassociated) alpha: colour error counts on
+    /// every texel, including texels whose alpha is zero, because filtering,
+    /// mipmapping or later premultiplication can still read that colour.
     Opaque,
     /// Encode BC1 texels below the threshold as transparent.
     PunchThrough {
         /// Alpha values strictly below this byte are transparent.
         threshold: u8,
     },
+    /// BC7 only: colour of texels whose alpha is zero is not scored, and those
+    /// texels may decode to any colour (currently black).
+    ///
+    /// Suitable for premultiplied-alpha input, where such colour is already
+    /// zero, and for cutouts whose transparent texels are never filtered.
+    /// Balanced and Quality spend the saved precision on visible colour and
+    /// alpha; Fast scores every texel either way. Output equals the BC7
+    /// output of release 0.2.1, which behaved this way by default.
+    IgnoreTransparentColour,
 }
 /// Endpoint objective for unsigned BC4 and BC5 channels.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -321,7 +334,11 @@ fn validate(
         || (matches!(settings.format, Format::Bc1 | Format::Bc3 | Format::Bc7)
             && image.channels != 4)
         || (settings.format == Format::Bc5 && !matches!(image.channels, 2 | 4))
-        || (settings.format != Format::Bc1 && !matches!(settings.alpha, AlphaPolicy::Opaque))
+        || match settings.alpha {
+            AlphaPolicy::Opaque => false,
+            AlphaPolicy::PunchThrough { .. } => settings.format != Format::Bc1,
+            AlphaPolicy::IgnoreTransparentColour => settings.format != Format::Bc7,
+        }
     {
         return Err(Error::UnsupportedPolicy);
     }
@@ -360,7 +377,7 @@ fn encode_row(image: ImageView<'_>, settings: &Settings, by: usize, row: &mut [u
                     }
                 }
             }
-            bc7::encode_batch(&blocks, dst, settings.effort);
+            bc7::encode_batch(&blocks, dst, settings.effort, settings.alpha);
         }
         return;
     }
@@ -407,7 +424,9 @@ fn encode_row(image: ImageView<'_>, settings: &Settings, by: usize, row: &mut [u
                 settings.effort,
                 settings.bc45_fit,
             )),
-            Format::Bc7 => dst.copy_from_slice(&bc7::encode(&pixels, settings.effort)),
+            Format::Bc7 => {
+                dst.copy_from_slice(&bc7::encode(&pixels, settings.effort, settings.alpha))
+            }
             Format::Bc6hUf16 | Format::Bc6hSf16 => unreachable!("validated byte input"),
         }
     }

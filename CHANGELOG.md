@@ -2,6 +2,33 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- BC7 Balanced and Quality wrote black colour (RGB 0) wherever source alpha
+  was 0, because their search scored colour only on texels with nonzero
+  alpha. They now treat alpha as straight and score colour on every texel,
+  so colour under zero alpha survives filtering, mipmapping and later
+  premultiplication.
+
+### Changed
+
+- BC7 Balanced and Quality end each block with a peak-aware choice: when the
+  lowest-error candidate has a channel error of 6 or more, a refined
+  candidate with a lower largest channel error and at most 1/8 more squared
+  error is taken instead. This lowers the texture-wide maximum byte error at
+  a small cost in PSNR. Balanced and Quality output bytes change; Fast and
+  the `IgnoreTransparentColour` policy keep their 0.2.1 output.
+- The README no longer carries the BC7 Quality performance claim: it was
+  measured on texels with nonzero alpha only and does not describe the new
+  default. BC7 has no performance claim until a new sealed set is evaluated.
+
+### Added
+
+- `AlphaPolicy::IgnoreTransparentColour` (BC7 only) reproduces the 0.2.1
+  Balanced and Quality output byte for byte, as an explicit opt-in for
+  premultiplied input or cutouts whose transparent texels are never filtered.
+  Other formats reject it with `Error::UnsupportedPolicy`.
+
 ## [0.2.1] - 2026-11-03
 
 ### Changed

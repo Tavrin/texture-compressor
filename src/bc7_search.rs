@@ -257,6 +257,9 @@ pub(crate) struct Search {
     /// It is the same for every block; allowances above only order and
     /// limit the candidates that compete for it.
     budget: u32,
+    /// Whether colour under zero alpha is unscored (opt-in policy); by
+    /// default every texel's colour counts (straight alpha).
+    hide_transparent: bool,
 }
 
 pub(crate) const BALANCED: Search = Search {
@@ -276,6 +279,7 @@ pub(crate) const BALANCED: Search = Search {
     pbit_tries: BALANCED_PBIT_TRIES,
     runner_up: BALANCED_RUNNER_UP,
     budget: BALANCED_BUDGET,
+    hide_transparent: false,
 };
 
 pub(crate) const QUALITY: Search = Search {
@@ -291,6 +295,7 @@ pub(crate) const QUALITY: Search = Search {
     pbit_tries: 3,
     runner_up: true,
     budget: QUALITY_BUDGET,
+    hide_transparent: false,
 };
 
 const BALANCED_BUDGET: u32 = 1300;
@@ -314,6 +319,44 @@ const COLOUR_WEIGHT: u8 = 1;
 // Whether the dual-mode estimate of a nonopaque block charges alpha
 // selector steps only to texels strictly between its extreme alphas.
 const VISIBLE_EXTREME_ALPHA: bool = true;
+// Peak-aware final choice: a block whose winner has a channel error of at
+// least PEAK_FLOOR takes the finalist with the lowest peak if that peak is
+// at least PEAK_GAIN lower and its squared error is at most 1/PEAK_SLACK
+// above the winner's. A texture's peak error is its worst block's.
+const PEAK_FLOOR: u8 = 6;
+const PEAK_GAIN: u8 = 1;
+const PEAK_SLACK: u32 = 8;
+
+// Up to eight refined candidates of one block, with their errors.
+type Finalists = [Option<(u32, Cand)>; 8];
+
+fn push_finalist(finalists: &mut Finalists, candidate: (u32, Cand)) {
+    if let Some(slot) = finalists.iter_mut().find(|f| f.is_none()) {
+        *slot = Some(candidate);
+    }
+}
+
+// Squared error stays the objective; the per-block peak decides only among
+// near-equal finalists, and only where the peak is large enough to set a
+// texture's maximum error.
+fn peak_choice(px: &Block, best: (u32, Cand), finalists: &Finalists) -> (u32, Cand) {
+    let peak = best.1.peak(px);
+    if peak < PEAK_FLOOR {
+        return best;
+    }
+    let limit = best.0.saturating_add(best.0 / PEAK_SLACK);
+    let mut pick = (peak, best);
+    for &(err, cand) in finalists.iter().flatten() {
+        if err > limit {
+            continue;
+        }
+        let p = cand.peak(px);
+        if p + PEAK_GAIN <= peak && (p, err) < (pick.0, pick.1 .0) {
+            pick = (p, (err, cand));
+        }
+    }
+    pick.1
+}
 
 /// Remaining work of one block, counted in representative passes: one unit
 /// is one distinct texel evaluated by one selector pass. Every optional step
@@ -435,6 +478,15 @@ fn alternate_work(reps: &Reps, candidate: &Cand, cfg: &Search) -> u32 {
 }
 
 impl Search {
+    /// These ceilings with colour under zero alpha scored (`false`, straight
+    /// alpha) or ignored (`true`).
+    pub(crate) const fn hiding_transparent(self, hide: bool) -> Self {
+        Self {
+            hide_transparent: hide,
+            ..self
+        }
+    }
+
     fn for_opaque_block(self, units: usize) -> Self {
         let mut local = self.for_block(units);
         // A small seed residual can conceal a missed partition on fine detail.
@@ -505,6 +557,70 @@ impl Cand {
             Cand::Two { mode, partition, s } => pack2(mode, partition, s),
             Cand::Three { partition, s } => pack3(partition, s),
         }
+    }
+
+    /// The decoded texels, from the dequantized endpoints and selectors that
+    /// [`Cand::pack`] stores (anchor flips leave them unchanged).
+    fn decode(self) -> Block {
+        let lerp = |f: &Fit, lv: &Levels, i: usize, c: usize| {
+            let w = lv.w[usize::from(f.idx[i])];
+            (((64 - w) * f.d[0][c] + w * f.d[1][c] + 32) >> 6) as u8
+        };
+        core::array::from_fn(|i| match self {
+            Cand::Six(f) => core::array::from_fn(|c| lerp(&f, &L4, i, c)),
+            Cand::Dual {
+                mode,
+                rotation,
+                sel,
+                color,
+                alpha,
+            } => {
+                let (_, cl, _, al) = dual_layout(mode, sel);
+                let r: [u8; 4] = core::array::from_fn(|c| {
+                    if c == 3 {
+                        lerp(&alpha, al, i, 3)
+                    } else {
+                        lerp(&color, cl, i, c)
+                    }
+                });
+                let map = dual_map(rotation, false);
+                let mut p = [0; 4];
+                for c in 0..4 {
+                    p[map[c]] = r[c];
+                }
+                p
+            }
+            Cand::Two { mode, partition, s } => {
+                let f = &s[usize::from(MASKS2[partition][0] >> i & 1 == 1)];
+                let lv = if mode == 1 { &L3 } else { &L2 };
+                core::array::from_fn(|c| {
+                    if c == 3 && mode != 7 {
+                        255
+                    } else {
+                        lerp(f, lv, i, c)
+                    }
+                })
+            }
+            Cand::Three { partition, s } => {
+                let k = masks3(partition)
+                    .iter()
+                    .position(|m| m >> i & 1 == 1)
+                    .unwrap_or(0);
+                core::array::from_fn(|c| if c == 3 { 255 } else { lerp(&s[k], &L3, i, c) })
+            }
+        })
+    }
+
+    /// Largest absolute byte error of any channel of any texel.
+    fn peak(self, px: &Block) -> u8 {
+        let d = self.decode();
+        let mut peak = 0;
+        for (a, b) in px.iter().zip(d.iter()) {
+            for c in 0..4 {
+                peak = peak.max(a[c].abs_diff(b[c]));
+            }
+        }
+        peak
     }
 }
 
@@ -1270,7 +1386,9 @@ fn search_seeded(px: &Block, cfg: &Search, seed: Option<Fit>) -> (u32, Cand) {
     // rounds.
     let deep = Search {
         axis_rounds: cfg.for_opaque_block(units).axis_rounds,
-        ..QUALITY.for_opaque_block(units)
+        ..QUALITY
+            .hiding_transparent(cfg.hide_transparent)
+            .for_opaque_block(units)
     };
     let cfg = &if !cfg.quality && reps.len <= 4 {
         deep
@@ -1351,6 +1469,8 @@ fn search_seeded(px: &Block, cfg: &Search, seed: Option<Fit>) -> (u32, Cand) {
     }
     let mut best_err = m6.err;
     let mut best = Cand::Six(m6);
+    let mut finalists: Finalists = [None; 8];
+    finalists[0] = Some((best_err, best));
     if best_err == 0 {
         return (0, best);
     }
@@ -1615,6 +1735,7 @@ fn search_seeded(px: &Block, cfg: &Search, seed: Option<Fit>) -> (u32, Cand) {
                 (s[0].err + s[1].err + s[2].err, Cand::Three { partition, s })
             }
         };
+        push_finalist(&mut finalists, candidate);
         if candidate.0 < best_err {
             (best_err, best) = candidate;
         }
@@ -1629,7 +1750,12 @@ fn search_seeded(px: &Block, cfg: &Search, seed: Option<Fit>) -> (u32, Cand) {
     if extra_precision && best_err > 0 && work.take(precision_work(&reps, &best, false)) {
         best_err = precision(px, &reps, &mut best, false);
     }
-    (best_err, best)
+    // The opt-in policy reproduces the earlier output on every block.
+    if cfg.hide_transparent {
+        (best_err, best)
+    } else {
+        peak_choice(px, (best_err, best), &finalists)
+    }
 }
 
 // Nonopaque blocks carry original-channel observation weights through every
@@ -1639,13 +1765,16 @@ fn visible_search(source: &Block, cfg: &Search) -> (u32, Cand) {
         axis_targets, dual_fit, fit, improve, parity, refine_dual, refine_subset, rough, Reps,
     };
 
+    // Straight alpha scores every texel's colour. Only the opt-in policy
+    // drops colour under zero alpha, which then decodes black.
     let mut px = *source;
-    let mut visible = 0u16;
-    for (i, p) in px.iter_mut().enumerate() {
-        if p[3] == 0 {
-            p[..3].fill(0);
-        } else {
-            visible |= 1 << i;
+    let mut visible = u16::MAX;
+    if cfg.hide_transparent {
+        for (i, p) in px.iter_mut().enumerate() {
+            if p[3] == 0 {
+                p[..3].fill(0);
+                visible &= !(1 << i);
+            }
         }
     }
     let px = &px;
@@ -1696,6 +1825,8 @@ fn visible_search(source: &Block, cfg: &Search) -> (u32, Cand) {
         work.refund(charge, passes * n);
     }
     let mut best = (m6.err, Cand::Six(m6));
+    let mut finalists: Finalists = [None; 8];
+    finalists[0] = Some(best);
     // Texels at the lowest or highest alpha are exact at the scalar
     // endpoints of modes 4 and 5 (a cutout's alpha needs no selector
     // steps); only the share of texels between them pays the step term.
@@ -1794,18 +1925,19 @@ fn visible_search(source: &Block, cfg: &Search) -> (u32, Cand) {
             let passes = refine_dual(p, r, mode, sel, &mut color, &mut alpha, cfg, false);
             work.refund(charge, passes * n);
         }
-        let err = color.err + alpha.err;
-        if err < best.0 {
-            best = (
-                err,
-                Cand::Dual {
-                    mode,
-                    rotation,
-                    sel,
-                    color,
-                    alpha,
-                },
-            );
+        let candidate = (
+            color.err + alpha.err,
+            Cand::Dual {
+                mode,
+                rotation,
+                sel,
+                color,
+                alpha,
+            },
+        );
+        push_finalist(&mut finalists, candidate);
+        if candidate.0 < best.0 {
+            best = candidate;
         }
     }
     let alpha_penalty: u32 = px.iter().map(|p| (255 - u32::from(p[3])).pow(2)).sum();
@@ -1859,9 +1991,13 @@ fn visible_search(source: &Block, cfg: &Search) -> (u32, Cand) {
                 }
                 work.refund(charge, used);
             }
-            let err = s[0].err + s[1].err + penalty;
-            if err < best.0 {
-                best = (err, Cand::Two { mode, partition, s });
+            let candidate = (
+                s[0].err + s[1].err + penalty,
+                Cand::Two { mode, partition, s },
+            );
+            push_finalist(&mut finalists, candidate);
+            if candidate.0 < best.0 {
+                best = candidate;
             }
         }
     }
@@ -1892,13 +2028,23 @@ fn visible_search(source: &Block, cfg: &Search) -> (u32, Cand) {
                 }
                 work.refund(charge, used);
             }
-            let err = s.iter().map(|s| s.err).sum::<u32>() + alpha_penalty;
-            if err < best.0 {
-                best = (err, Cand::Three { partition, s });
+            let candidate = (
+                s.iter().map(|s| s.err).sum::<u32>() + alpha_penalty,
+                Cand::Three { partition, s },
+            );
+            push_finalist(&mut finalists, candidate);
+            if candidate.0 < best.0 {
+                best = candidate;
             }
         }
     }
-    best
+    // The opt-in policy reproduces the earlier output on every block
+    // (its invisible colour would otherwise enter the peak).
+    if cfg.hide_transparent {
+        best
+    } else {
+        peak_choice(px, best, &finalists)
+    }
 }
 
 #[cfg(feature = "simd")]
@@ -1924,12 +2070,12 @@ mod tests {
                     if i < visible_count { 1 } else { 0 },
                 ]
             });
-            for cfg in [&BALANCED, &QUALITY] {
-                let a = search(&px, cfg);
+            for cfg in [BALANCED, QUALITY].map(|c| c.hiding_transparent(true)) {
+                let a = search(&px, &cfg);
                 for p in &mut px[visible_count..] {
                     p[..3].copy_from_slice(&[251, 92, 177]);
                 }
-                let b = search(&px, cfg);
+                let b = search(&px, &cfg);
                 assert_eq!(a.0, b.0);
                 assert_eq!(a.1.pack(), b.1.pack());
             }
@@ -2308,16 +2454,20 @@ mod tests {
                 continue;
             }
             let opaque = px.iter().all(|p| p[3] == 255);
-            for cfg in [&BALANCED, &QUALITY] {
-                let (err, cand) = search(&px, cfg);
+            for (cfg, hide) in [BALANCED, QUALITY]
+                .into_iter()
+                .flat_map(|c| [false, true].map(|h| (c.hiding_transparent(h), h)))
+            {
+                let (err, cand) = search(&px, &cfg);
                 let block = cand.pack();
                 let d = super::super::super::independent_decoder::decode(&block);
+                assert_eq!(cand.decode(), d, "case {case}");
                 let sse: u64 = px
                     .iter()
                     .zip(d)
                     .map(|(a, b)| {
                         (0..4)
-                            .filter(|&c| c == 3 || a[3] > 0)
+                            .filter(|&c| !hide || c == 3 || a[3] > 0)
                             .map(|c| (i64::from(a[c]) - i64::from(b[c])).pow(2) as u64)
                             .sum::<u64>()
                     })
