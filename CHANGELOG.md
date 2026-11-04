@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-11-04
+
+### Changed
+
+- BC7 Quality tries every mode-5 rotation on opaque blocks with at most two colours,
+  recovering exact fits missed by tied variance estimates that do not account
+  for endpoint quantization. Other blocks retain their earlier search breadth.
+
 ## [0.2.3] - 2026-11-04
 
 ### Changed

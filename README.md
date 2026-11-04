@@ -297,6 +297,12 @@ as the first 16 hex digits of their SHA-256). No panic, overflow, illegal block,
 alpha mismatch or backend mismatch was found. It does not cover NEON or
 WebAssembly, or images larger than 23x23 texels.
 
+#### 0.2.4 additions (BC7 rotation search for two-colour opaque blocks)
+
+`bc7_encode` unchanged; the corpus of the 0.2.3 campaign (5,838 inputs) was
+rerun against the new Quality search. Two 600 s chunks on one core, 155,250
+executions, coverage 6,181 and 6,181 (the second chunk added none), no crash.
+
 ## Licence
 
 Licensed under either the [MIT licence](LICENSE-MIT) or the
