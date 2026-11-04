@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-11-04
+
 ### Changed
 
 - BC7 Quality tries every mode-5 rotation on opaque blocks with at most two colours,
