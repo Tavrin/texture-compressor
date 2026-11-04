@@ -311,7 +311,7 @@ pub(crate) const BALANCED: Search = Search {
 pub(crate) const QUALITY: Search = Search {
     quality: true,
     axis_rounds: 2,
-    duals: [2, 4],
+    duals: [4, 4],
     rough_iters: 1,
     mode4_iters: 2,
     parts: [8, 8, 16],
@@ -777,7 +777,9 @@ impl Search {
             // Low-residual fits spend their small allowance on endpoint
             // precision; larger residuals spend it on additional partitions.
             axis_rounds: if units == 1 { self.axis_rounds } else { 0 },
-            duals: [self.duals[0], (scale + units / 2).min(self.duals[1])],
+            // Sparse opaque Quality blocks can restore the full mode-5
+            // allowance after this ordinary rotation ranking limit.
+            duals: [self.duals[0].min(2), (scale + units / 2).min(self.duals[1])],
             rough_iters: self.rough_iters,
             parts: if self.quality {
                 [scale * units, scale * units, 2 * scale * units]
@@ -1669,7 +1671,14 @@ fn search_seeded(px: &Block, cfg: &Search, seed: Option<Fit>) -> (u32, Cand) {
             .hiding_transparent(cfg.hide_transparent)
             .for_opaque_block(units)
     };
-    let cfg = &if !cfg.quality && reps.len <= 4 {
+    let cfg = &if cfg.quality && !cfg.hide_transparent && reps.len <= 2 {
+        // Collinear colours can tie every mode-5 rotation's variance estimate.
+        // Endpoint quantization breaks that tie: only the scalar stream has
+        // eight-bit endpoints. Fit all rotations before rejecting an exact fit.
+        let mut local = cfg.for_opaque_block(units);
+        local.duals[0] = cfg.duals[0];
+        local
+    } else if !cfg.quality && reps.len <= 4 {
         deep
     } else if !cfg.quality && (grey || saturated) {
         // Quality's refinement depth and alternate seed; breadth stays
@@ -2330,6 +2339,34 @@ pub(super) fn encode_seeded(px: &Block, cfg: &Search, seed: Option<Fit>) -> [u8;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quality_sparse_rotations_recover_exact_endpoints() {
+        // One channel needs eight-bit endpoints; putting it in the colour
+        // stream incurs error even though the rotation estimates tie.
+        for colours in [
+            [[16, 28, 33], [16, 68, 65]],
+            [[0, 4, 5], [0, 8, 10]],
+            [[0, 4, 5], [0, 4, 5]],
+            [[16, 0, 33], [16, 0, 33]],
+        ] {
+            for rotation in 0..3 {
+                let px: Block = core::array::from_fn(|i| {
+                    let c = colours[usize::from(i % 4 != 0)];
+                    [
+                        c[rotation],
+                        c[(rotation + 1) % 3],
+                        c[(rotation + 2) % 3],
+                        255,
+                    ]
+                });
+                let block = encode_with(&px, &QUALITY);
+                let mut decoded = [0; 64];
+                bcdec_rs::bc7(&block, &mut decoded, 16);
+                assert_eq!(decoded.as_chunks::<4>().0, px.as_slice());
+            }
+        }
+    }
 
     #[test]
     fn invisible_rgb_cannot_change_search_or_allocation() {
