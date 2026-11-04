@@ -265,6 +265,38 @@ inputs, identical sorted digests (`9b254c777fa8d799`), exit 0. `bc7_encode`:
 after the fix. Both on x86_64 with AVX2; `-rss_limit_mb=512`
 throughout.
 
+#### 0.2.3 additions (BC7 transparent SIMD kernels, rounds 3 and 4)
+
+`bc7_encode` gained near-grey colour (structured colour style 4; raw layout bit
+6) and, in the raw layout, forced all-255 alpha (bit 4) and 0/255 cutout alpha
+(bit 5), next to the existing opaque, cutout, all-zero and noise alpha. It
+asserts that an image whose alpha is 255 everywhere decodes to alpha exactly
+255 under both alpha policies, on top of the legal-mode, `encode` equals
+`encode_into`, repeat and block-independence checks. Fast, Balanced and Quality
+run with `Opaque` and `IgnoreTransparentColour`. Scalar against dispatched SIMD
+is compared by corpus replay with `BC7_DIGEST_LOG`, as above.
+
+Seeds: the 310 inputs of the previous `bc7_encode` corpus plus 934 raw-layout
+inputs cut from 1 to 6 real 4x4 blocks of the 4096x4096 development textures, each with a random choice of
+preset and of the new flags. Reach from a seed replay with LLVM coverage
+(104-input shards, 5,459 edges): `bc7_search.rs` 90%, `bc7_fast.rs` 83%,
+`bc7_objective.rs` 70%, `bc7_simd/avx2.rs` 87% and `bc7_simd/kernels.rs` 99.5%
+of lines.
+
+| Target | Segments | Executions | Edges | Result |
+| --- | --- | ---: | --- | --- |
+| `bc7_encode` | 5 x 601 s on one core (50 CPU-minutes) | 173,403; 98,213; 93,212; 91,515; 93,275 | 5,459 at start; 6,176, 6,177, 6,178, 6,179, 6,179 | exit 0 each, no crash |
+
+The fifth segment added no edge in 601 s. All segments used
+`-rss_limit_mb=512` and `ASAN_OPTIONS=quarantine_size_mb=16`. The final corpus
+(5,838 files, not committed) was replayed with `-runs=0` under
+`TEXENC_SIMD=scalar`, `sse41`, `avx2` and the default dispatch: 5,837 logged
+inputs each (one file is too short for either layout and returns before the check), exit 0, and
+the sorted output digests of the four runs are identical (`bcaf50e7b52fadb5`
+as the first 16 hex digits of their SHA-256). No panic, overflow, illegal block,
+alpha mismatch or backend mismatch was found. It does not cover NEON or
+WebAssembly, or images larger than 23x23 texels.
+
 ## Licence
 
 Licensed under either the [MIT licence](LICENSE-MIT) or the
