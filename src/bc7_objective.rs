@@ -295,10 +295,12 @@ impl SumTable {
     /// and mode 7 (`[1]`).
     pub(super) fn rankings(&self) -> [[(f32, f32); 64]; 2] {
         let total = self.sums(0xffff);
-        let mut out = [[(0f32, 0f32); 64]; 2];
         #[cfg(feature = "simd")]
-        if self.rankings_simd(&total, &mut out) {
-            return out;
+        {
+            let mut out = [[(0f32, 0f32); 64]; 2];
+            if self.rankings_simd(&total, &mut out) {
+                return out;
+            }
         }
         self.rankings_scalar(&total)
     }
@@ -393,6 +395,7 @@ impl SumTable {
         true
     }
 
+    #[cfg(feature = "simd")]
     fn roots(&self) -> (f32, f32) {
         (
             root_weight(i32::from(self.o.colour_weight)),
@@ -405,10 +408,12 @@ impl SumTable {
         count: usize,
         masks: impl Fn(usize) -> [u16; 3],
     ) -> [(f32, f32); 64] {
-        let mut out = [(f32::MAX, 0f32); 64];
         #[cfg(feature = "simd")]
-        if self.rankings3_simd(count, &masks, &mut out) {
-            return out;
+        {
+            let mut out = [(f32::MAX, 0f32); 64];
+            if self.rankings3_simd(count, &masks, &mut out) {
+                return out;
+            }
         }
         self.rankings3_scalar(count, &masks)
     }

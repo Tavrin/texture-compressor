@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-11-04
+
 ### Changed
 
 - BC7 Balanced and Quality encode opaque blocks faster: the least-squares

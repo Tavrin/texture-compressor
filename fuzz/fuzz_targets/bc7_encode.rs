@@ -5,7 +5,8 @@
 //! and the first full block encodes identically alone and inside the image
 //! (independence from batch position). With `BC7_DIGEST_LOG=<file>` each input's
 //! output digest is appended, so a replay under `TEXENC_SIMD=scalar` can be
-//! compared byte for byte against a replay under the dispatched backend.
+//! compared byte for byte against a replay under the dispatched backend. An
+//! image whose alpha is 255 everywhere must decode to alpha exactly 255.
 #![no_main]
 use libfuzzer_sys::fuzz_target;
 use std::io::Write;
@@ -38,6 +39,11 @@ fuzz_target!(|data: &[u8]| {
             // every odd block so all-transparent blocks with colour are common.
             let policy = policy_of(first >> 2);
             let zero_odd = first & 8 != 0;
+            // Bit 4 forces every alpha to 255, bit 5 makes alpha cutout (0 or
+            // 255 by threshold), bit 6 turns colour near-grey (red plus two bits
+            // of noise on each channel).
+            let (all_opaque, cutout, near_grey) =
+                (first & 0x10 != 0, first & 0x20 != 0, first & 0x40 != 0);
             let blocks = (rest.len() / 64).clamp(1, 6);
             let width = 4 * blocks as u32;
             let mut px = vec![0u8; blocks * 64];
@@ -46,8 +52,18 @@ fuzz_target!(|data: &[u8]| {
                     let (b, o) = (i / 16, i % 16);
                     let at = b * 64 + row * 16 + o;
                     *v = rest.get(at).copied().unwrap_or(0);
-                    if zero_odd && b % 2 == 1 && o % 4 == 3 {
-                        *v = 0;
+                    if o % 4 != 3 && near_grey {
+                        let red = rest.get(at - o % 4).copied().unwrap_or(0);
+                        *v = red.saturating_add(*v & 3);
+                    }
+                    if o % 4 == 3 {
+                        if all_opaque {
+                            *v = 255;
+                        } else if cutout {
+                            *v = if *v < 128 { 0 } else { 255 };
+                        } else if zero_odd && b % 2 == 1 {
+                            *v = 0;
+                        }
                     }
                 }
             }
@@ -75,7 +91,7 @@ fuzz_target!(|data: &[u8]| {
             rest[i % rest.len()]
         }
     };
-    let color_style = (shape >> 4) % 4;
+    let color_style = (shape >> 4) % 5;
     let alpha_style = shape & 7;
     let mut px = vec![0u8; count];
     for i in 0..count {
@@ -115,6 +131,8 @@ fuzz_target!(|data: &[u8]| {
             (_, 1) => src(c + 4 * usize::from(src(texel) & 3)),
             // Smooth ramp with sparse noise.
             (_, 2) => (texel as u8).wrapping_mul(7).wrapping_add(src(c) & 15),
+            // Near-grey: one base level per texel plus two bits of noise.
+            (_, 4) => src(texel * 4).saturating_add(src(i) & 3),
             _ => src(c),
         };
     }
@@ -177,6 +195,22 @@ fn check(
                 !(transparent == texels && coloured >= 4 && !decoded_colour),
                 "block {blk} effort {effort:?}: colour under zero alpha decoded to black"
             );
+        }
+    }
+    // A source whose alpha is 255 everywhere must decode to alpha exactly 255.
+    let all_255 = (0..height as usize)
+        .all(|y| (0..width as usize).all(|x| px[y * stride + x * 4 + 3] == 255));
+    if all_255 {
+        let bw = (width as usize).div_ceil(4);
+        for (blk, block) in out.chunks_exact(16).enumerate() {
+            let decoded = reference::decode(block);
+            let (bx, by) = (blk % bw, blk / bw);
+            for (i, d) in decoded.iter().enumerate() {
+                let (x, y) = (bx * 4 + i % 4, by * 4 + i / 4);
+                if x < width as usize && y < height as usize {
+                    assert_eq!(d[3], 255, "block {blk} effort {effort:?} {policy:?}: alpha");
+                }
+            }
         }
     }
     let mut into = vec![0u8; len];

@@ -544,6 +544,10 @@ fn axis_endpoints<const C0: usize, const C1: usize>(
 }
 
 // Least-squares endpoints for fixed selectors.
+/// Least-squares sums `(aa, ab, bb, ax, bx)` of one subset.
+#[cfg(not(feature = "simd"))]
+type LsSums = (i32, i32, i32, [i32; 4], [i32; 4]);
+
 fn least_squares<const C0: usize, const C1: usize>(
     px: &Block,
     reps: &Reps,
@@ -556,7 +560,7 @@ fn least_squares<const C0: usize, const C1: usize>(
     #[cfg(feature = "simd")]
     let sums = simd::ls_sums::<C0, C1>(px, reps, idx, lv).map(|s| (s.aa, s.ab, s.bb, s.ax, s.bx));
     #[cfg(not(feature = "simd"))]
-    let sums: Option<(i32, i32, i32, [i32; 4], [i32; 4])> = None;
+    let sums: Option<LsSums> = None;
     let (aa, ab, bb, ax, bx) = match sums {
         Some(s) => s,
         None => {
