@@ -17,6 +17,15 @@
   is lower and its squared error is at most a quarter higher. This lowers
   texture-wide maximum errors on a few textures. Balanced and Quality
   output bytes change on opaque blocks; Fast is unchanged.
+- BC7 Balanced and Quality refine more candidates on hard blocks: for
+  opaque blocks with a channel error of 10 or more, already-refined
+  finalists also get the second look's quarter allowance, and one extra
+  rough candidate within 32 of the best error is refined. Quality also
+  stops a lower block peak from raising the colour peak above the larger
+  of the winner's colour peak and the candidate's own alpha peak. This
+  lowers per-channel peak and PSNR losses on near-grey and cutout
+  textures. Balanced and Quality output bytes change; Fast and the
+  `IgnoreTransparentColour` output are unchanged.
 
 - BC7 Balanced and Quality encode blocks with transparent texels faster:
   the weighted search shares its per-texel sums across colour channels and
