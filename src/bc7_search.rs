@@ -364,6 +364,19 @@ const PEAK_LOOK: bool = true;
 const PEAK_LOOK_FLOOR: u8 = 10;
 const PEAK_LOOK_REFINE: usize = 2;
 const PEAK_LOOK_SLACK: u32 = 4;
+// Refined finalists of an opaque winner whose peak reaches PEAK_LOOK_FLOOR
+// compete under the look's bound too (see `peak_choice`).
+const PEAK_WIDE_FINALISTS: bool = true;
+// A lower peak may not raise the colour peak (see `peak_groups_hold`).
+const PEAK_GROUPS: bool = true;
+// Rough fits are refined while within a quarter of the best refined error;
+// up to LOW_REFINE_EXTRA more while within LOW_REFINE_SLACK of it (see the
+// refinement loop). Measured on the development set, slacks of 32, 64 and
+// 128 gave the same guard results; one extra candidate kept them at about
+// the earlier Quality time, while no count limit cost about 10% on the
+// slowest opaque textures.
+const LOW_REFINE_SLACK: u32 = 32;
+const LOW_REFINE_EXTRA: usize = 1;
 
 // Up to eight refined candidates of one block, with their errors.
 type Finalists = [Option<(u32, Cand)>; 8];
@@ -382,29 +395,45 @@ fn push_finalist(finalists: &mut Finalists, candidate: (u32, Cand)) {
 // near-equal finalists, and only where the peak is large enough to set a
 // texture's maximum error. Second-look candidates compete under their own,
 // wider error bound.
-// `peak` is the winner's.
+// `peak` is the winner's. `wide_finalists` (opaque blocks) gives finalists
+// the look's bound at PEAK_LOOK_FLOOR; `protect_colour` applies
+// `peak_groups_hold`.
 fn peak_choice(
     px: &Block,
     best: (u32, Cand),
     peak: u8,
     finalists: &Finalists,
     look: &Look,
+    wide_finalists: bool,
+    protect_colour: bool,
 ) -> (u32, Cand) {
     if peak < PEAK_FLOOR {
         return best;
     }
     let near = best.0.saturating_add(best.0 / PEAK_SLACK);
     let wide = best.0.saturating_add(best.0 / PEAK_LOOK_SLACK);
+    // A winner whose peak reaches the second-look floor lets its refined
+    // finalists compete under the second look's bound as well: the look
+    // skips candidates the search already refined.
+    let finalist_limit = if PEAK_WIDE_FINALISTS && wide_finalists && peak >= PEAK_LOOK_FLOOR {
+        wide
+    } else {
+        near
+    };
     let mut pick = (peak, best);
-    let tiers = [(near, &finalists[..]), (wide, &look[..])];
+    let tiers = [(finalist_limit, &finalists[..]), (wide, &look[..])];
+    // Colour and alpha peaks of the winner; see `peak_groups_hold`.
+    let held = best.1.peaks(px);
     for (limit, list) in tiers {
         for &(err, cand) in list.iter().flatten() {
             if err > limit {
                 continue;
             }
-            let p = cand.peak(px);
+            let groups = cand.peaks(px);
+            let p = groups[0].max(groups[1]);
             // `peak - p >= PEAK_GAIN` without u8 overflow when p is 255.
             if peak.checked_sub(p).is_some_and(|gain| gain >= PEAK_GAIN)
+                && (!protect_colour || peak_groups_hold(held, groups))
                 && (p, err) < (pick.0, pick.1 .0)
             {
                 pick = (p, (err, cand));
@@ -412,6 +441,18 @@ fn peak_choice(
         }
     }
     pick.1
+}
+
+// Colour and alpha peaks of a texture differ in scale: an alpha edge is a
+// step that every encoder misses by more than smooth colour, so a block's
+// alpha peak rarely sets the texture's alpha maximum while its colour peak
+// can set the colour maximum. A lower block peak therefore may not move the
+// error into colour: the candidate's colour peak may rise above the winner's
+// only up to the candidate's own alpha peak. Lowering the colour peak at the
+// cost of alpha stays allowed. Opaque blocks have no alpha error.
+// `[colour, alpha]` peaks, as `Cand::peaks` returns them.
+fn peak_groups_hold(winner: [u8; 2], candidate: [u8; 2]) -> bool {
+    !PEAK_GROUPS || candidate[0] <= winner[0].max(candidate[1])
 }
 
 // The block with channel c read from channel map[c] (a dual-mode rotation).
@@ -843,14 +884,21 @@ impl Cand {
 
     /// Largest absolute byte error of any channel of any texel.
     fn peak(self, px: &Block) -> u8 {
+        let [colour, alpha] = self.peaks(px);
+        colour.max(alpha)
+    }
+
+    /// Largest absolute byte error of the colour channels and of alpha.
+    fn peaks(self, px: &Block) -> [u8; 2] {
         let d = self.decode();
-        let mut peak = 0;
+        let mut peaks = [0; 2];
         for (a, b) in px.iter().zip(d.iter()) {
             for c in 0..4 {
-                peak = peak.max(a[c].abs_diff(b[c]));
+                let g = usize::from(c == 3);
+                peaks[g] = peaks[g].max(a[c].abs_diff(b[c]));
             }
         }
-        peak
+        peaks
     }
 }
 
@@ -1923,12 +1971,24 @@ fn search_seeded(px: &Block, cfg: &Search, seed: Option<Fit>) -> (u32, Cand) {
         len += 1;
     }
     let mut refined: [Option<Rough>; 7] = [None; 7];
+    // In a low-error block, endpoint quantization dominates a rough fit's
+    // error and refinement (other p-bits, polish) removes most of it, so up
+    // to LOW_REFINE_EXTRA candidates beyond the quarter are refined while
+    // within LOW_REFINE_SLACK. The opt-in policy keeps the earlier rule.
+    let (slack, mut extra) = if cfg.hide_transparent {
+        (0, 0)
+    } else {
+        (LOW_REFINE_SLACK, LOW_REFINE_EXTRA)
+    };
     for &slot in &order[..len] {
         let Some(r) = pool[slot] else {
             continue;
         };
         if r.err() > best_err.saturating_add(best_err / 4) {
-            continue;
+            if extra == 0 || r.err() > best_err.saturating_add(slack) {
+                continue;
+            }
+            extra -= 1;
         }
         refined[slot] = Some(r);
         let candidate = refine_rough(px, &reps, r, cfg, &mut work, flat_extreme_alpha);
@@ -1962,7 +2022,7 @@ fn search_seeded(px: &Block, cfg: &Search, seed: Option<Fit>) -> (u32, Cand) {
         flat_extreme_alpha,
         |r, work| refine_rough(px, &reps, r, cfg, work, flat_extreme_alpha),
     );
-    peak_choice(px, (best_err, best), peak, &finalists, &look)
+    peak_choice(px, (best_err, best), peak, &finalists, &look, true, false)
 }
 
 // Nonopaque blocks carry original-channel observation weights through every
@@ -2253,7 +2313,10 @@ fn visible_search(source: &Block, cfg: &Search) -> (u32, Cand) {
     // Nonopaque blocks take no second look: measured on the 71-texture
     // set, it raised other channels' peaks and cost PSNR on noisy alpha.
     let peak = best.1.peak(px);
-    peak_choice(px, best, peak, &finalists, &[None; PEAK_LOOK_REFINE])
+    // Quality only: measured on the development set, Balanced's fewer
+    // refined finalists gain no colour peak from it and lose alpha PSNR.
+    let no_look = [None; PEAK_LOOK_REFINE];
+    peak_choice(px, best, peak, &finalists, &no_look, false, cfg.quality)
 }
 
 #[cfg(feature = "simd")]
@@ -2310,12 +2373,43 @@ mod tests {
         let mut finalists: Finalists = [None; 8];
         finalists[1] = Some((1200, red));
         let none = [None; PEAK_LOOK_REFINE];
-        let (err, _) = peak_choice(&px, (1000, black), 20, &finalists, &none);
+        let (err, _) = peak_choice(&px, (1000, black), 20, &finalists, &none, false, false);
         assert_eq!(err, 1000);
+        // An opaque winner at PEAK_LOOK_FLOOR or above extends the look's
+        // bound to its finalists.
+        let (err, picked) = peak_choice(&px, (1000, black), 20, &finalists, &none, true, false);
+        assert_eq!((err, picked.peak(&px)), (1200, 10));
         let mut look: Look = [None; PEAK_LOOK_REFINE];
         look[0] = Some((1200, red));
-        let (err, picked) = peak_choice(&px, (1000, black), 20, &[None; 8], &look);
+        let (err, picked) = peak_choice(&px, (1000, black), 20, &[None; 8], &look, false, false);
         assert_eq!((err, picked.peak(&px)), (1200, 10));
+    }
+
+    #[test]
+    fn peak_choice_does_not_move_a_peak_from_alpha_into_colour() {
+        let px: Block = [[100; 4]; 16];
+        let flat = |d: [i32; 4]| {
+            Cand::Six(Fit {
+                err: 0,
+                d: [d; 2],
+                idx: [0; 16],
+            })
+        };
+        // Winner: colour peak 8, alpha peak 19.
+        let winner = flat([108, 100, 100, 119]);
+        let none = [None; PEAK_LOOK_REFINE];
+        // Peak 18, but in colour, where the winner's was 8.
+        let mut finalists: Finalists = [None; 8];
+        finalists[1] = Some((1100, flat([118, 100, 100, 114])));
+        let (err, _) = peak_choice(&px, (1000, winner), 19, &finalists, &none, false, true);
+        assert_eq!(err, 1000);
+        // Without the colour guard (Balanced) it is taken.
+        let (err, _) = peak_choice(&px, (1000, winner), 19, &finalists, &none, false, false);
+        assert_eq!(err, 1100);
+        // Peak 18 in alpha with a colour peak of 12 lowers the block's peak.
+        finalists[1] = Some((1100, flat([112, 100, 100, 118])));
+        let (err, picked) = peak_choice(&px, (1000, winner), 19, &finalists, &none, false, true);
+        assert_eq!((err, picked.peaks(&px)), (1100, [12, 18]));
     }
 
     #[test]
@@ -2336,6 +2430,8 @@ mod tests {
             cand.peak(&px),
             &finalists,
             &[None; PEAK_LOOK_REFINE],
+            true,
+            false,
         );
         assert_eq!(err, 1000);
         assert_eq!(picked.pack(), cand.pack());
