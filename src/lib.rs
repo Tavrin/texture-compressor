@@ -67,6 +67,11 @@ pub enum AlphaPolicy {
     /// alpha; Fast scores every texel either way. Output equals the BC7
     /// output of release 0.2.1, which behaved this way by default.
     IgnoreTransparentColour,
+    /// BC7 only: preserve source alpha zero exactly. Only blocks containing
+    /// zero alpha use the constrained fit; other blocks use the ordinary fit.
+    /// Soft alpha and straight colour, including hidden colour, remain lossy.
+    /// Constrained blocks try mode 6 and independent colour/alpha modes 4/5.
+    PreserveZeroAlpha,
 }
 /// Endpoint objective for unsigned BC4 and BC5 channels.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -337,7 +342,9 @@ fn validate(
         || match settings.alpha {
             AlphaPolicy::Opaque => false,
             AlphaPolicy::PunchThrough { .. } => settings.format != Format::Bc1,
-            AlphaPolicy::IgnoreTransparentColour => settings.format != Format::Bc7,
+            AlphaPolicy::IgnoreTransparentColour | AlphaPolicy::PreserveZeroAlpha => {
+                settings.format != Format::Bc7
+            }
         }
     {
         return Err(Error::UnsupportedPolicy);

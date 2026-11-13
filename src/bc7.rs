@@ -1003,6 +1003,11 @@ fn rank_moments(
 /// Encode one block. Only [`AlphaPolicy::IgnoreTransparentColour`] changes
 /// the scored texels; every other policy scores straight RGBA on all texels.
 pub(crate) fn encode(pixels: &[[u8; 4]; 16], effort: Effort, alpha: AlphaPolicy) -> [u8; 16] {
+    if alpha == AlphaPolicy::PreserveZeroAlpha {
+        if let Some(block) = fast::preserving_zero_alpha(pixels, effort) {
+            return block;
+        }
+    }
     let hide = alpha == AlphaPolicy::IgnoreTransparentColour;
     match effort {
         Effort::Fast => fast::encode(pixels),
@@ -1022,6 +1027,12 @@ pub(crate) fn encode_batch(
     effort: Effort,
     alpha: AlphaPolicy,
 ) {
+    if alpha == AlphaPolicy::PreserveZeroAlpha {
+        for (pixels, output) in blocks.iter().zip(out.chunks_exact_mut(16)) {
+            output.copy_from_slice(&encode(pixels, effort, alpha));
+        }
+        return;
+    }
     fast::encode_batch(
         blocks,
         out,
