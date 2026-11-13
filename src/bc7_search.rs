@@ -1621,6 +1621,14 @@ pub(crate) fn encode_with(px: &Block, cfg: &Search) -> [u8; 16] {
     }
 }
 
+pub(super) fn preserving_zero_alpha(px: &Block, cfg: &Search) -> Option<[u8; 16]> {
+    let candidate = search(px, cfg).1;
+    px.iter()
+        .zip(candidate.decode())
+        .all(|(source, decoded)| source[3] != 0 || decoded[3] == 0)
+        .then(|| candidate.pack())
+}
+
 // The best candidate found for a block and its exact decoded error.
 fn search(px: &Block, cfg: &Search) -> (u32, Cand) {
     search_seeded(px, cfg, None)

@@ -335,8 +335,13 @@ fn quantize_with<const C0: usize, const C1: usize>(
     let table = &QUANT[prec.bits];
     let mut d = [[255i32; 4]; 2];
     for k in 0..2 {
+        let p = if C1 == 4 && prec.pbit == PBit::Unique && matches!(t[k][3], 0 | 255) {
+            usize::from(t[k][3] == 255)
+        } else {
+            choice[k]
+        };
         for c in C0..C1 {
-            d[k][c] = i32::from(table[choice[k]][t[k][c] as usize]);
+            d[k][c] = i32::from(table[p][t[k][c] as usize]);
         }
     }
     d
@@ -1143,6 +1148,84 @@ fn dual(px: &Block, reps: &Reps, mode: usize, sel: usize, rounds: usize) -> (Fit
             fit::<3, 4>(px, reps, P4A, al, 2, rounds, false),
         )
     }
+}
+
+pub(super) fn preserving_zero_alpha(px: &Block, effort: crate::Effort) -> Option<[u8; 16]> {
+    if !px.iter().any(|p| p[3] == 0) {
+        return None;
+    }
+    let cfg = if effort == crate::Effort::Quality {
+        &QUALITY
+    } else {
+        &BALANCED
+    };
+    if let Some(block) = search::preserving_zero_alpha(px, cfg) {
+        return Some(block);
+    }
+    let lo = px.iter().map(|p| p[3]).min().unwrap();
+    let hi = px.iter().map(|p| p[3]).max().unwrap();
+    let reps = Reps::distinct(px);
+    let rounds = match effort {
+        crate::Effort::Fast => 0,
+        crate::Effort::Balanced => 1,
+        crate::Effort::Quality => 2,
+    };
+    let mut best = (u32::MAX, [0; 16]);
+    // Keep mode 6's sixteen alpha levels available under the zero constraint.
+    // Pin a zero-alpha selector and quantize its endpoint with p-bit zero.
+    let seed = fit::<0, 4>(px, &reps, P6, &L4, 2, rounds, false);
+    for zero in 0..2 {
+        let mut f = seed;
+        for pass in 0..=rounds + 1 {
+            let mut targets = if pass == 0 {
+                f.d
+            } else {
+                let Some(targets) = least_squares::<0, 4>(px, &reps, &f.idx, &L4) else {
+                    break;
+                };
+                targets
+            };
+            targets[zero][3] = 0;
+            f.d = quantize::<0, 4>(&targets, P6, false);
+            select::<0, 4>(px, &reps, &f.d, &L4, &mut f.idx, u32::MAX);
+            f.err = 0;
+            for (i, p) in px.iter().enumerate() {
+                if p[3] == 0 {
+                    f.idx[i] = (zero * 15) as u8;
+                }
+                let w = L4.w[usize::from(f.idx[i])];
+                for c in 0..4 {
+                    let decoded = ((64 - w) * f.d[0][c] + w * f.d[1][c] + 32) >> 6;
+                    let delta = i32::from(p[c]) - decoded;
+                    f.err += (delta * delta) as u32;
+                }
+            }
+            if f.err < best.0 {
+                best = (f.err, pack6(f));
+            }
+        }
+    }
+    for (mode, sel, cp, cl, ap, al) in [
+        (5, 0, P5C, &L2, P5A, &L2),
+        (4, 0, P4C, &L2, P4A, &L3),
+        (4, 1, P4C, &L3, P4A, &L2),
+    ] {
+        let color = fit::<0, 3>(px, &reps, cp, cl, 2, rounds, false);
+        let mut targets = [[0; 4]; 2];
+        targets[0][3] = i32::from(lo);
+        targets[1][3] = i32::from(hi);
+        let mut alpha = Fit {
+            d: quantize::<3, 4>(&targets, ap, false),
+            idx: [0; 16],
+            err: 0,
+        };
+        alpha.err = select::<3, 4>(px, &reps, &alpha.d, al, &mut alpha.idx, u32::MAX);
+        let error = color.err + alpha.err;
+        if error < best.0 {
+            best = (error, pack_dual(mode, 0, sel, color, alpha));
+        }
+    }
+    Some(best.1)
 }
 
 pub(super) fn encode(px: &Block) -> [u8; 16] {

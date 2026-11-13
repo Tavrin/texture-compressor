@@ -53,6 +53,13 @@ or cutouts whose transparent texels are never filtered,
 from scoring that colour (it may then decode black) and spends the precision
 on visible texels instead.
 
+For UI cutouts and coverage masks, `with_alpha(AlphaPolicy::PreserveZeroAlpha)`
+keeps source alpha zero exact while retaining soft alpha and straight colour.
+Only blocks containing zero alpha use this constraint. They try a constrained
+mode 6 fit (sixteen alpha levels) and modes 4/5 with separate colour/alpha
+selectors. Other blocks use the ordinary fit; nonzero alpha remains lossy.
+Opaque blocks and blocks without either alpha extreme retain the normal search.
+
 ### Single channel to BC4
 
 ```rust
